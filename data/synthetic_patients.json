@@ -49,15 +49,7 @@
       "value": 81.0,
       "unit": "beats/min",
       "effective_date": "2026-04-18"
-    },
-    {
-      "id": "obs-eaa55f02",
-      "patient_id": "pat-001",
-      "code": "8310-5",
-      "display": "Body temperature",
-      "value": 98.6,
-      "unit": "degF",
-      "effective_date": "2026-06-01"
     }
   ]
 }
+
