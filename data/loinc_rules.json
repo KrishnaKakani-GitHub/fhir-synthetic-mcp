@@ -1,0 +1,143 @@
+{
+  "_comment": "LOINC code validation rules. Each entry defines: display name, physical value range (min/max), canonical unit, hard reject threshold (reject_below), clinical flag threshold (flag_above), and a clinical note for review cases. Used by validator.py as a deterministic gate in store.stage_write().",
+
+  "8867-4": {
+    "display": "Heart rate",
+    "min": 20,
+    "max": 300,
+    "unit": "/min",
+    "reject_below": 0,
+    "flag_above": 200,
+    "clinical_note": "Values above 200 /min require immediate clinical review (tachyarrhythmia protocol)."
+  },
+
+  "55284-4": {
+    "display": "Systolic blood pressure",
+    "min": 40,
+    "max": 300,
+    "unit": "mm[Hg]",
+    "reject_below": 0,
+    "flag_above": 180,
+    "clinical_note": "SBP >180 mm[Hg] meets hypertensive urgency threshold (JNC 8)."
+  },
+
+  "8310-5": {
+    "display": "Body temperature",
+    "min": 90,
+    "max": 115,
+    "unit": "degF",
+    "reject_below": 80,
+    "flag_above": 104,
+    "clinical_note": "Temperature >104 degF (40 degC) requires urgent evaluation."
+  },
+
+  "59408-5": {
+    "display": "Oxygen saturation by pulse oximetry",
+    "min": 50,
+    "max": 100,
+    "unit": "%",
+    "reject_below": 0,
+    "flag_above": 100,
+    "clinical_note": "SpO2 <88% typically indicates supplemental oxygen requirement."
+  },
+
+  "9279-1": {
+    "display": "Respiratory rate",
+    "min": 4,
+    "max": 80,
+    "unit": "/min",
+    "reject_below": 0,
+    "flag_above": 30,
+    "clinical_note": "RR >30 /min is a severity marker in pneumonia (CURB-65) and sepsis."
+  },
+
+  "2339-0": {
+    "display": "Glucose [Mass/volume] in Blood",
+    "min": 20,
+    "max": 600,
+    "unit": "mg/dL",
+    "reject_below": 0,
+    "flag_above": 400,
+    "clinical_note": "BG >400 mg/dL requires evaluation for DKA/HHS; <54 mg/dL is clinically significant hypoglycemia (ADA)."
+  },
+
+  "4548-4": {
+    "display": "Hemoglobin A1c/Hemoglobin.total in Blood",
+    "min": 2.0,
+    "max": 20.0,
+    "unit": "%",
+    "reject_below": 0,
+    "flag_above": 15.0,
+    "clinical_note": "HbA1c >15% suggests very poorly controlled diabetes; verify specimen quality."
+  },
+
+  "2160-0": {
+    "display": "Creatinine [Mass/volume] in Serum or Plasma",
+    "min": 0.1,
+    "max": 30.0,
+    "unit": "mg/dL",
+    "reject_below": 0,
+    "flag_above": 10.0,
+    "clinical_note": "Creatinine >10 mg/dL typically indicates severe chronic kidney disease or AKI requiring urgent nephrology review."
+  },
+
+  "718-7": {
+    "display": "Hemoglobin [Mass/volume] in Blood",
+    "min": 2.0,
+    "max": 25.0,
+    "unit": "g/dL",
+    "reject_below": 0,
+    "flag_above": 20.0,
+    "clinical_note": "Hemoglobin <7 g/dL is a common transfusion trigger threshold (varies by clinical context)."
+  },
+
+  "6690-2": {
+    "display": "Leukocytes [#/volume] in Blood by Automated count",
+    "min": 0.1,
+    "max": 150.0,
+    "unit": "10*3/uL",
+    "reject_below": 0,
+    "flag_above": 100.0,
+    "clinical_note": "WBC >100 x10^3/uL warrants evaluation for leukemia; <2 x10^3/uL indicates severe leukopenia."
+  },
+
+  "2823-3": {
+    "display": "Potassium [Moles/volume] in Serum or Plasma",
+    "min": 1.5,
+    "max": 9.0,
+    "unit": "mEq/L",
+    "reject_below": 0,
+    "flag_above": 6.5,
+    "clinical_note": "K+ >6.5 mEq/L (critical hyperkalemia): cardiac arrhythmia risk, requires immediate intervention."
+  },
+
+  "2951-2": {
+    "display": "Sodium [Moles/volume] in Serum or Plasma",
+    "min": 100,
+    "max": 180,
+    "unit": "mEq/L",
+    "reject_below": 0,
+    "flag_above": 160,
+    "clinical_note": "Na+ >160 mEq/L (critical hypernatremia) or <120 mEq/L (severe hyponatremia): neurological emergency risk."
+  },
+
+  "29463-7": {
+    "display": "Body weight",
+    "min": 0.5,
+    "max": 700,
+    "unit": "kg",
+    "reject_below": 0,
+    "flag_above": 500,
+    "clinical_note": "Weights outside the 0.5-700 kg range are almost certainly data entry errors."
+  },
+
+  "8302-2": {
+    "display": "Body height",
+    "min": 30,
+    "max": 280,
+    "unit": "cm",
+    "reject_below": 0,
+    "flag_above": 250,
+    "clinical_note": "Heights outside 30-280 cm are almost certainly data entry errors."
+  }
+}

@@ -1,0 +1,66 @@
+[
+  {
+    "id": "note-001",
+    "patient_id": "pat-001",
+    "date": "2026-05-15",
+    "author": "dr.smith",
+    "type": "progress_note",
+    "content": "Patient presents for routine follow-up of hypertension and type 2 diabetes. BP 142/88 mm Hg today — still above JNC 8 target of 140/90 for diabetic patients. Current regimen: lisinopril 10mg daily, metformin 1000mg BID. HbA1c from last month: 7.4% — above ADA target of <7%. Patient reports adherence. Discussed dietary sodium restriction and increased physical activity. Plan: uptitrate lisinopril to 20mg, recheck HbA1c and BMP in 3 months. Continue SMBG twice daily.",
+    "diagnoses": ["I10", "E11.65"],
+    "vitals": {
+      "sbp": 142,
+      "dbp": 88,
+      "hr": 74,
+      "temp": 98.4,
+      "spo2": 98
+    }
+  },
+  {
+    "id": "note-002",
+    "patient_id": "pat-001",
+    "date": "2026-04-01",
+    "author": "dr.smith",
+    "type": "lab_review",
+    "content": "Laboratory results reviewed. HbA1c 7.4% (target <7%). Creatinine 1.1 mg/dL (stable, eGFR approximately 68 mL/min — CKD G2 staging). Potassium 4.2 mEq/L — within normal range. CBC: Hgb 13.8 g/dL (no anaemia). Glucose 118 mg/dL fasting. Overall metabolic control suboptimal but no acute concerns. Continue current medications with uptitration of lisinopril per outpatient plan.",
+    "diagnoses": ["I10", "E11.65", "N18.2"],
+    "labs": {
+      "hba1c": 7.4,
+      "creatinine": 1.1,
+      "potassium": 4.2,
+      "hemoglobin": 13.8,
+      "glucose_fasting": 118
+    }
+  },
+  {
+    "id": "note-003",
+    "patient_id": "pat-002",
+    "date": "2026-05-20",
+    "author": "dr.jones",
+    "type": "progress_note",
+    "content": "Patient is a 67-year-old male presenting with exertional dyspnoea and fatigue for 3 weeks. Heart rate 94 /min at rest, irregular rhythm — atrial fibrillation on 12-lead ECG. SpO2 96% on room air. RR 18 /min. No signs of decompensated heart failure at this time. Echocardiogram ordered. Rate control with metoprolol succinate 25mg daily initiated. CHA₂DS₂-VASc score 3 (age 67, male, hypertension) — anticoagulation indicated. Apixaban 5mg BID prescribed. INR monitoring not required with DOAC.",
+    "diagnoses": ["I48.91", "I10", "R00.0"],
+    "vitals": {
+      "sbp": 138,
+      "dbp": 84,
+      "hr": 94,
+      "spo2": 96,
+      "rr": 18
+    }
+  },
+  {
+    "id": "note-004",
+    "patient_id": "pat-002",
+    "date": "2026-05-28",
+    "author": "dr.jones",
+    "type": "specialist_referral",
+    "content": "Cardiology referral for new-onset AF in a 67-year-old male with hypertension. Echo: LVEF 55%, mild LA enlargement (4.4 cm), no valvular disease. Thyroid function normal. Rate control adequate on metoprolol 25mg — resting HR 78 /min at today's visit (AHA lenient target <110 achieved). Rhythm control discussion deferred to cardiology. Anticoagulation with apixaban 5mg BID ongoing. Follow-up in 4 weeks or sooner if symptoms worsen.",
+    "diagnoses": ["I48.91", "I10"],
+    "vitals": {
+      "sbp": 132,
+      "dbp": 80,
+      "hr": 78,
+      "spo2": 97,
+      "rr": 16
+    }
+  }
+]
