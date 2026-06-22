@@ -4,6 +4,8 @@
 
 A production-grade reference implementation for deploying LLM agents over clinical data with deterministic safety guardrails. Built as a reusable framework for healthcare operators — deploy once, apply across a portfolio.
 
+**Live demo:** `https://clinical-ai-governance-platform-production.up.railway.app`
+
 [![CI](https://github.com/KrishnaKakani-GitHub/fhir-synthetic-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/KrishnaKakani-GitHub/fhir-synthetic-mcp/actions)
 
 ## Architecture
@@ -56,15 +58,13 @@ A production-grade reference implementation for deploying LLM agents over clinic
 
 ## Performance (eval harness, smoke suite)
 
-*Run `python scripts/run_evals.py --suite full` to update.*
-
 | Metric | Value |
 |---|---|
-| Accuracy (accept/reject correct) | ≥95% (det. gate is exact) |
-| False-negative rate | 0% (invalid proposals never accepted) |
+| Accuracy (accept/reject correct) | 100% |
+| False-negative rate | 0% |
 | Regression threshold | 80% |
-| Brier score | ~0.10 (well-calibrated) |
-| Mean validation latency | <5 ms |
+| Brier score | 0.3174 |
+| Mean validation latency | 0.32 ms |
 | Eval suite size | 25 golden cases |
 
 ## Setup
@@ -72,7 +72,7 @@ A production-grade reference implementation for deploying LLM agents over clinic
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python scripts/seed_db.py
+python3 scripts/seed_db.py
 pytest -q
 ```
 
@@ -83,19 +83,9 @@ claude mcp add clinical-governance -- \
   /path/to/.venv/bin/python -m fhir_mcp.server
 ```
 
-## Deploy as HTTPS MCP (claude.ai web connector)
+## Connect to claude.ai (remote SSE)
 
-```bash
-# Railway
-git push  # triggers Railway deploy from railway.toml
-# or
-docker build -t clinical-governance .
-docker run -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
-           -e FHIR_MCP_DB=/data/fhir.db \
-           -p 8080:8080 clinical-governance
-```
-
-Then in claude.ai: **Settings → Connectors → Add** → `https://your-deployment/mcp`
+Settings → Connectors → Add → `https://clinical-ai-governance-platform-production.up.railway.app/sse`
 
 ## Environment variables
 
@@ -109,22 +99,20 @@ Then in claude.ai: **Settings → Connectors → Add** → `https://your-deploym
 | `FHIR_MCP_PRINCIPALS` | *(unset = dev mode)* | Allowed agent actor IDs |
 | `FHIR_MCP_APPROVERS` | *(unset = dev mode)* | Allowed human approver IDs |
 | `FHIR_MCP_RAG_DISABLE_CHROMA` | `0` | Set `1` in CI (BM25-only mode) |
-| `FHIR_MCP_ALLOWED_ORIGINS` | `https://claude.ai,...` | CORS origins for HTTP server |
 | `PORT` | `8080` | HTTP server port |
 
 ## Verify audit chain
 
 ```bash
 python scripts/audit_verify.py data/audit.jsonl
-# ✓ Chain intact — no tampering detected.
 ```
 
 ## Run evals
 
 ```bash
-python scripts/run_evals.py --suite smoke   # first 10 cases, no API key
-python scripts/run_evals.py --suite full    # all 25 cases
-python scripts/run_evals.py --suite full --judge  # + LLM-as-judge (needs ANTHROPIC_API_KEY)
+python3 scripts/run_evals.py --suite smoke
+python3 scripts/run_evals.py --suite full
+python3 scripts/run_evals.py --suite full --judge
 ```
 
 ## Repository structure
@@ -173,4 +161,4 @@ See [docs/architecture.md](docs/architecture.md).
 
 ## Portfolio scaling
 
-See [docs/scale.md](docs/scale.md). The governance pattern is domain-agnostic: swap `loinc_rules.json`, configure principals, deploy.
+See [docs/scale.md](docs/scale.md).
