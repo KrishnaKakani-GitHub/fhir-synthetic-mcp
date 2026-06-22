@@ -1,14 +1,9 @@
-"""Pydantic v2 models for the FHIR MCP server.
-
-These intentionally mirror a *subset* of FHIR fields. They are simplified for
-a synthetic-data development server, not a spec-complete FHIR implementation.
-"""
-
+"""Pydantic v2 data models for the Clinical AI Governance Platform."""
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from enum import Enum
-from typing import Literal
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -21,21 +16,17 @@ class Gender(str, Enum):
 
 
 class Patient(BaseModel):
-    """Minimal FHIR Patient resource (synthetic)."""
-
-    id: str = Field(..., description="Logical resource id, e.g. 'pat-001'.")
+    id: str
     name: str
     birth_date: date
     gender: Gender
-    mrn: str = Field(..., description="Medical record number (synthetic).")
+    mrn: str
 
 
 class Observation(BaseModel):
-    """Minimal FHIR Observation resource (synthetic)."""
-
     id: str
-    patient_id: str = Field(..., description="Reference to Patient.id.")
-    code: str = Field(..., description="LOINC code.")
+    patient_id: str
+    code: str
     display: str
     value: float
     unit: str
@@ -43,22 +34,12 @@ class Observation(BaseModel):
 
 
 class DataStore(BaseModel):
-    """Root document persisted to JSON."""
-
+    """Root model for the legacy JSON fixture (seed only)."""
     patients: list[Patient] = Field(default_factory=list)
     observations: list[Observation] = Field(default_factory=list)
 
 
-# --- Gated-write models -------------------------------------------------------
-
-
 class ProposedObservation(BaseModel):
-    """A write an agent *proposes*. It is staged, never committed directly.
-
-    PHI note: this carries clinical values. In production, persist only
-    references/IDs where possible and minimise the raw payload retained.
-    """
-
     patient_id: str
     code: str
     display: str
@@ -74,14 +55,12 @@ class PendingWriteStatus(str, Enum):
 
 
 class PendingWrite(BaseModel):
-    """A staged write awaiting human-in-the-loop approval."""
-
     write_id: str
-    resource_type: Literal["Observation"] = "Observation"
+    resource_type: str = "Observation"
     proposed: ProposedObservation
     status: PendingWriteStatus = PendingWriteStatus.pending
-    created_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
-    decided_at: datetime | None = None
-    decided_by: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now())
+    decided_at: Optional[datetime] = None
+    decided_by: Optional[str] = None
+    # Clinical warnings from the deterministic validator (non-blocking)
+    validation_warnings: list[str] = Field(default_factory=list)

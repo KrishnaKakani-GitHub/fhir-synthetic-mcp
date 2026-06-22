@@ -1,8 +1,8 @@
-"""Data store: SQLite backend.
+"""Data store: SQLite backend with deterministic validation gate.
 
 Same public interface as v1 (FhirStore). The write gate
 (propose → stage → approve/reject) is unchanged — only the
-persistence layer is replaced.
+persistence layer is replaced and validator.py is now called.
 
 Design decisions:
 - sqlite3 stdlib only (no ORM, no external deps)
@@ -10,6 +10,8 @@ Design decisions:
 - Foreign keys: prevents orphaned observations
 - Pending writes are in-memory only (intentional) — proposals are
   never persisted until a human approves them
+- validator.validate_observation() is called in stage_write() before
+  the proposal enters the queue — this is the deterministic gate
 
 PHI NOTE: All PHI touchpoints are in this module only. The store
 deliberately never logs record contents — that responsibility lives
@@ -31,6 +33,7 @@ from .models import (
     PendingWriteStatus,
     ProposedObservation,
 )
+from .validator import ValidationError, validate_observation
 
 
 class StoreError(Exception):
@@ -136,9 +139,13 @@ class FhirStore:
     def stage_write(self, proposed: ProposedObservation) -> PendingWrite:
         """Stage a proposed observation. Does NOT commit. Returns the ticket.
 
-        This is the deterministic validation gate. Richer clinical checks
-        (LOINC validity, value ranges) will be added in validator.py (Day 2)
-        and called here before queuing.
+        Deterministic validation order:
+          1. Patient exists check (structural)
+          2. Negative value guard (basic sanity)
+          3. Non-empty code check (basic sanity)
+          4. LOINC registry + value range + unit (clinical)
+
+        Any failure raises StoreError. The proposal never enters the queue.
         """
         self.get_patient(proposed.patient_id)  # patient must exist
         if proposed.value < 0:
@@ -146,9 +153,21 @@ class FhirStore:
         if not proposed.code.strip():
             raise StoreError("Observation code is required.")
 
+        # Deterministic clinical validation gate
+        result = validate_observation(proposed)
+        if not result.ok:
+            raise StoreError(
+                "Proposal rejected by deterministic validation: "
+                + "; ".join(result.violations)
+            )
+
         with self._lock:
             write_id = f"pw-{uuid.uuid4().hex[:8]}"
-            pending = PendingWrite(write_id=write_id, proposed=proposed)
+            pending = PendingWrite(
+                write_id=write_id,
+                proposed=proposed,
+                validation_warnings=result.warnings or [],
+            )
             self._pending[write_id] = pending
             return pending
 
