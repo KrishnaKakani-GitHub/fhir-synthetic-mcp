@@ -1,16 +1,21 @@
-"""FHIR MCP server (FastMCP 3.x, stdio transport).
+"""FHIR MCP server — Clinical AI Governance Platform.
 
-This is the file Claude Code launches. It defines the *tools* Claude can call.
-Each tool is a normal Python function with a @mcp.tool() decorator; FastMCP
-turns the type hints + docstring into the schema Claude sees.
+This is the file Claude Code and the Agent SDK launch. It defines the
+tools Claude can call. Each tool:
+  1. Verifies the caller's identity (auth layer)
+  2. Delegates to the store
+  3. Emits a tamper-evident audit record on both success and error paths
 
-Mental model: this server is a passive provider. Claude connects, asks "what
-tools do you have?", and calls them. The server never calls Claude.
+The write gate invariant is preserved:
+  - Agents can READ and PROPOSE
+  - Only a verified human approver can COMMIT via approve_write
+
+Mental model: this server is a passive provider. Claude connects, asks
+"what tools do you have?", and calls them. The server never calls Claude.
 
 Run locally:   python -m fhir_mcp.server
-Register:      claude mcp add fhir-synthetic -- python -m fhir_mcp.server
+Register:      claude mcp add clinical-governance -- python -m fhir_mcp.server
 """
-
 from __future__ import annotations
 
 import os
@@ -20,22 +25,22 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from .audit import audit
+from .auth import AuthError, verify_agent_actor, verify_approver
 from .models import ProposedObservation
 from .store import FhirStore, StoreError
 
-# Data path is configurable via env var so you never hardcode a real path.
-_DATA_PATH = Path(
+_DB_PATH = Path(
     os.environ.get(
-        "FHIR_MCP_DATA",
-        Path(__file__).resolve().parents[2] / "data" / "synthetic_patients.json",
+        "FHIR_MCP_DB",
+        Path(__file__).resolve().parents[2] / "data" / "fhir.db",
     )
 )
 
-mcp = FastMCP("fhir-synthetic")
-store = FhirStore(_DATA_PATH)
+mcp = FastMCP("clinical-ai-governance")
+store = FhirStore(_DB_PATH)
 
-# Who the agent is. In a real deployment this comes from authenticated identity,
-# NOT a constant — the audit "actor" is only as trustworthy as your auth layer.
+# Agent actor identity. In production this comes from authenticated identity,
+# NOT a constant — the audit 'actor' is only as trustworthy as auth.py.
 _AGENT_ACTOR = os.environ.get("FHIR_MCP_ACTOR", "agent:dev")
 
 
@@ -44,7 +49,13 @@ _AGENT_ACTOR = os.environ.get("FHIR_MCP_ACTOR", "agent:dev")
 
 @mcp.tool()
 def list_patients(reason: str) -> list[str]:
-    """List available patient IDs (synthetic). `reason`: why you need this."""
+    """List available patient IDs. `reason`: why you need this list."""
+    try:
+        verify_agent_actor(_AGENT_ACTOR)
+    except AuthError as e:
+        audit(actor=_AGENT_ACTOR, action="list_patients", reason=reason,
+              outcome="error", extra={"error": str(e)})
+        raise
     ids = store.get_patient_ids()
     audit(actor=_AGENT_ACTOR, action="list_patients", reason=reason, target_ids=ids)
     return ids
@@ -52,58 +63,37 @@ def list_patients(reason: str) -> list[str]:
 
 @mcp.tool()
 def get_patient(patient_id: str, reason: str) -> dict:
-    """Read one patient's demographics (synthetic PHI-shaped data).
-
-    Returns minimal fields. `reason` is recorded in the audit trail.
-    """
+    """Read one patient's demographics. `reason` is recorded in the audit trail."""
     try:
+        verify_agent_actor(_AGENT_ACTOR)
         patient = store.get_patient(patient_id)
-    except StoreError as e:
-        audit(
-            actor=_AGENT_ACTOR,
-            action="get_patient",
-            reason=reason,
-            target_ids=[patient_id],
-            outcome="error",
-            extra={"error": str(e)},
-        )
+    except (AuthError, StoreError) as e:
+        audit(actor=_AGENT_ACTOR, action="get_patient", reason=reason,
+              target_ids=[patient_id], outcome="error", extra={"error": str(e)})
         raise
-    audit(
-        actor=_AGENT_ACTOR,
-        action="get_patient",
-        reason=reason,
-        target_ids=[patient_id],
-    )
+    audit(actor=_AGENT_ACTOR, action="get_patient", reason=reason,
+          target_ids=[patient_id])
     return patient.model_dump(mode="json")
 
 
 @mcp.tool()
 def list_observations(patient_id: str, reason: str) -> list[dict]:
-    """List a patient's observations (synthetic). `reason` is audited."""
+    """List a patient's observations. `reason` is audited."""
     try:
+        verify_agent_actor(_AGENT_ACTOR)
         obs = store.list_observations(patient_id)
-    except StoreError as e:
-        audit(
-            actor=_AGENT_ACTOR,
-            action="list_observations",
-            reason=reason,
-            target_ids=[patient_id],
-            outcome="error",
-            extra={"error": str(e)},
-        )
+    except (AuthError, StoreError) as e:
+        audit(actor=_AGENT_ACTOR, action="list_observations", reason=reason,
+              target_ids=[patient_id], outcome="error", extra={"error": str(e)})
         raise
-    audit(
-        actor=_AGENT_ACTOR,
-        action="list_observations",
-        reason=reason,
-        target_ids=[patient_id],
-    )
+    audit(actor=_AGENT_ACTOR, action="list_observations", reason=reason,
+          target_ids=[patient_id])
     return [o.model_dump(mode="json") for o in obs]
 
 
 # --- Gated write tools --------------------------------------------------------
-# The agent can PROPOSE a write and LIST what's pending, but it CANNOT approve.
-# Approval is a separate tool meant to be driven by a human in the loop.
+# The agent can PROPOSE and LIST pending, but it CANNOT approve.
+# Approval is a separate tool driven by a human in the loop.
 
 
 @mcp.tool()
@@ -119,7 +109,7 @@ def propose_observation(
     """Propose a new observation. Stages it for human approval; does NOT write.
 
     Returns a pending-write ticket (write_id). A human must call
-    `approve_write` before anything is committed to the data file.
+    `approve_write` before anything is committed to the database.
     `effective_date` is ISO format YYYY-MM-DD.
     """
     proposed = ProposedObservation(
@@ -131,37 +121,30 @@ def propose_observation(
         effective_date=date.fromisoformat(effective_date),
     )
     try:
+        verify_agent_actor(_AGENT_ACTOR)
         pending = store.stage_write(proposed)
-    except (StoreError, ValueError) as e:
-        audit(
-            actor=_AGENT_ACTOR,
-            action="propose_observation",
-            reason=reason,
-            target_ids=[patient_id],
-            outcome="error",
-            extra={"error": str(e)},
-        )
+    except (AuthError, StoreError, ValueError) as e:
+        audit(actor=_AGENT_ACTOR, action="propose_observation", reason=reason,
+              target_ids=[patient_id], outcome="error", extra={"error": str(e)})
         raise
-    audit(
-        actor=_AGENT_ACTOR,
-        action="propose_observation",
-        reason=reason,
-        target_ids=[patient_id],
-        extra={"write_id": pending.write_id, "status": "pending"},
-    )
+    audit(actor=_AGENT_ACTOR, action="propose_observation", reason=reason,
+          target_ids=[patient_id],
+          extra={"write_id": pending.write_id, "status": "pending"})
     return pending.model_dump(mode="json")
 
 
 @mcp.tool()
 def list_pending_writes(reason: str) -> list[dict]:
     """List writes awaiting human approval. For the reviewer's eyes."""
+    try:
+        verify_agent_actor(_AGENT_ACTOR)
+    except AuthError as e:
+        audit(actor=_AGENT_ACTOR, action="list_pending_writes", reason=reason,
+              outcome="error", extra={"error": str(e)})
+        raise
     pending = store.list_pending()
-    audit(
-        actor=_AGENT_ACTOR,
-        action="list_pending_writes",
-        reason=reason,
-        target_ids=[p.write_id for p in pending],
-    )
+    audit(actor=_AGENT_ACTOR, action="list_pending_writes", reason=reason,
+          target_ids=[p.write_id for p in pending])
     return [p.model_dump(mode="json") for p in pending]
 
 
@@ -170,44 +153,35 @@ def approve_write(write_id: str, approver: str, reason: str) -> dict:
     """HUMAN-IN-THE-LOOP GATE. Commit a staged write.
 
     `approver` must identify the human authorising this. This is the only
-    path that writes patient data to the store. Use deliberately.
+    path that writes patient data to the database. Use deliberately.
     """
     try:
+        verify_approver(approver)
         obs = store.approve_write(write_id, approver=approver)
-    except StoreError as e:
-        audit(
-            actor=approver,
-            action="approve_write",
-            reason=reason,
-            target_ids=[write_id],
-            outcome="error",
-            extra={"error": str(e)},
-        )
+    except (AuthError, StoreError) as e:
+        audit(actor=approver, action="approve_write", reason=reason,
+              target_ids=[write_id], outcome="error", extra={"error": str(e)})
         raise
-    audit(
-        actor=approver,  # the HUMAN is the actor here, not the agent
-        action="approve_write",
-        reason=reason,
-        target_ids=[write_id, obs.id],
-        extra={"committed_observation_id": obs.id},
-    )
+    audit(actor=approver, action="approve_write", reason=reason,
+          target_ids=[write_id, obs.id],
+          extra={"committed_observation_id": obs.id})
     return obs.model_dump(mode="json")
 
 
 @mcp.tool()
 def reject_write(write_id: str, approver: str, reason: str) -> dict:
     """HUMAN-IN-THE-LOOP GATE. Reject a staged write (nothing is committed)."""
-    pending = store.reject_write(write_id, approver=approver)
-    audit(
-        actor=approver,
-        action="reject_write",
-        reason=reason,
-        target_ids=[write_id],
-        extra={"status": "rejected"},
-    )
+    try:
+        verify_approver(approver)
+        pending = store.reject_write(write_id, approver=approver)
+    except (AuthError, StoreError) as e:
+        audit(actor=approver, action="reject_write", reason=reason,
+              target_ids=[write_id], outcome="error", extra={"error": str(e)})
+        raise
+    audit(actor=approver, action="reject_write", reason=reason,
+          target_ids=[write_id], extra={"status": "rejected"})
     return pending.model_dump(mode="json")
 
 
 if __name__ == "__main__":
-    # Default transport is stdio: Claude Code launches this as a subprocess.
     mcp.run()
