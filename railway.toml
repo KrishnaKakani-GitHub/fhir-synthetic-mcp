@@ -1,0 +1,20 @@
+# Railway.app deployment configuration
+# https://docs.railway.app/reference/railway-toml
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "uvicorn fhir_mcp.http_server:app --host 0.0.0.0 --port $PORT --no-access-log"
+healthcheckPath = "/health"
+healthcheckTimeout = 10
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+# Required environment variables (set in Railway dashboard):
+#   ANTHROPIC_API_KEY
+#   FHIR_MCP_ACTOR=agent:prod
+#   FHIR_MCP_PRINCIPALS=agent:prod
+#   FHIR_MCP_APPROVERS=dr.smith@yourorg.com
+#   FHIR_MCP_ALLOWED_ORIGINS=https://claude.ai,https://api.claude.ai

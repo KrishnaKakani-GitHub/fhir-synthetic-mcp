@@ -1,38 +1,42 @@
 # Python
 __pycache__/
 *.py[cod]
-*.egg-info/
-.eggs/
+*$py.class
+*.so
+.Python
 build/
 dist/
+*.egg-info/
+.eggs/
 
 # Virtual environments
 .venv/
 venv/
 env/
 
-# Test / tooling caches
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Local editor / agent config
-.claude/
-
-# OS
-.DS_Store
-
-# Secrets / env
+# Environment files
 .env
 .env.*
-*.key
-*.pem
+!.env.example
 
-# Claude agent config (credentials)
-.claude.json
-CLAUDE.local.md
+# Data (generated)
+data/fhir.db
+data/audit.jsonl
 
-# Local runtime data / DB (keep seed, ignore mutations + db)
-data/*.local.json
-*.db
-audit/
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# Eval outputs
+eval_report.json
+evals/results/
