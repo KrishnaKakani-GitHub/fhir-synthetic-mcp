@@ -4,12 +4,12 @@ WORKDIR /app
 
 # Install dependencies
 RUN pip install --no-cache-dir \
-    fastmcp \
+    "fastmcp>=2.0" \
     pydantic \
     anthropic \
     rank-bm25 \
     fastapi \
-    uvicorn[standard]
+    "uvicorn[standard]"
 
 # Copy source
 COPY src/ ./src/
@@ -31,4 +31,4 @@ ENV FHIR_MCP_DB=/data/fhir.db \
 
 EXPOSE 8080
 
-CMD uvicorn fhir_mcp.http_server:app --host 0.0.0.0 --port ${PORT:-8080} --no-access-log
+CMD python src/fhir_mcp/run_server.py
