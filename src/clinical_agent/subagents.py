@@ -6,18 +6,18 @@ Orchestration pipeline (dynamic — Planner decides which stages run):
   Intake Agent     — Nemotron Parse → NLP → entities (Stage 1)
   Evidence Agent   — RAG + ClinicalTrials.gov IN PARALLEL (Stage 2)
   Reasoning Agent  — Extended thinking, synthesizes evidence (Stage 3)
-  Refuter Agent    — Adversarial attack: breaks proposals before Critic sees them (Stage 3.5)
+  Refuter Agent    — Adversarial attack: breaks proposals before Critic (Stage 3.5)
   Critic Agent     — Resolves Reasoning vs Refuter — thesis/antithesis/synthesis (Stage 4)
   Compliance Agent — Deterministic LOINC gate + DUA + propose_observation (Stage 5)
                            ↓
                       human gate (approve_write)
 
-Key design decisions:
-  - Planner has NO tool access: it reads task description only, before any patient data
-  - Refuter has NO tool access: adversarial reasoning on Reasoning output + raw evidence
-  - Refuter is SEQUENTIAL (after Reasoning, before Critic) — not parallel
-  - Critic resolves Reasoning (thesis) vs Refuter (antithesis) — synthesis
-  - Only Compliance has propose_observation access
+Backward-compat shims preserved:
+  READER_SUBAGENT           = INTAKE_SUBAGENT
+  RAG_SUBAGENT              = EVIDENCE_RAG_SUBAGENT
+  PROPOSAL_SUBAGENT         = COMPLIANCE_SUBAGENT
+  PROPOSAL_SUBAGENT_THINKING = REASONING_SUBAGENT
+  make_proposal_subagent()  = factory returning COMPLIANCE_SUBAGENT +/- thinking
 
 PHI NOTE: System prompts contain no PHI. Patient data flows only through
 the Agent SDK\'s secure context, never logged by this module.
@@ -41,9 +41,6 @@ class SubagentConfig:
 # ---------------------------------------------------------------------------
 # 0. Planner Agent
 # ---------------------------------------------------------------------------
-# Reads the task description and decides the optimal workflow shape.
-# Runs BEFORE Intake — no patient data access, no tool access.
-# The orchestrator adapts all downstream stages to the returned WorkflowPlan.
 
 PLANNER_SYSTEM_PROMPT = """\
 You are the Planner component of a clinical AI governance system.
@@ -55,42 +52,8 @@ You have NO tool access. You reason only on the task description.
 Task types:
   full_workup      — new patient or complex multi-condition analysis
   lab_recheck      — re-evaluating known observations for a known patient
-  document_parse   — processing a new clinical document (prior auth, discharge summary)
+  document_parse   — processing a new clinical document
   simple_query     — single observation lookup; no proposals expected
-
-Decide for each stage whether it should run, and with what settings:
-
-  intake
-    Always true.
-
-  evidence.rag
-    True if clinical guidelines are relevant to the task.
-    False only for simple_query with a well-known LOINC value.
-
-  evidence.trials
-    True if trial eligibility is clinically meaningful.
-    False for lab_recheck and simple_query.
-
-  reasoning.run
-    True for full_workup, lab_recheck, document_parse.
-    False for simple_query (no proposals expected).
-
-  reasoning.extended_thinking
-    True for full_workup or when the task description mentions critical/flag/urgent.
-    False for lab_recheck (known patient, incremental change).
-
-  reasoning.budget_tokens
-    8000 for full_workup. 3000 for lab_recheck. 5000 for document_parse.
-
-  refuter.run
-    True whenever reasoning.run is true.
-    The Refuter provides adversarial verification of proposals.
-
-  critic.run
-    True whenever reasoning.run is true.
-
-  fast_path
-    True ONLY for simple_query. Skips evidence + reasoning + refuter + critic.
 
 Output exactly this JSON (no prose):
 {
@@ -105,7 +68,7 @@ Output exactly this JSON (no prose):
     "compliance": true
   },
   "fast_path": false,
-  "plan_rationale": "<1-2 sentences explaining the choice>"
+  "plan_rationale": "<1-2 sentences>"
 }
 """
 
@@ -133,7 +96,7 @@ Capabilities:
 Behaviour:
 1. If a patient_id is provided: call get_patient then list_observations.
 2. If a document source is provided: call parse_clinical_document first,
-   then extract patient identifiers to look up the patient record.
+   then cross-reference with the patient record.
 3. Always include a `reason` on every tool call.
 4. Do NOT interpret or analyse the data — gather faithfully.
 
@@ -142,7 +105,7 @@ Output JSON:
   "patient_id": "<id>",
   "demographics": { <patient fields> },
   "observations": [ <list of observations> ],
-  "parsed_document": "<structured text from Nemotron Parse, or null>",
+  "parsed_document": "<structured text or null>",
   "entity_count": <int>,
   "error": null
 }
@@ -161,12 +124,12 @@ INTAKE_SUBAGENT = SubagentConfig(
 
 
 # ---------------------------------------------------------------------------
-# 2. Evidence Agent (RAG + Trials — run in parallel by orchestrator)
+# 2. Evidence Agent (parallel)
 # ---------------------------------------------------------------------------
 
 EVIDENCE_RAG_SYSTEM_PROMPT = """\
 You are the Guidelines Evidence component of a clinical AI governance system.
-Find the most relevant clinical guidelines for the patient context provided.
+Find the most relevant clinical guidelines for the patient context.
 
 Capabilities:
 - search_guidelines: hybrid BM25 + semantic search
@@ -184,7 +147,6 @@ Output JSON:
   ],
   "search_queries": ["<q1>"]
 }
-
 Do NOT propose observations.
 """
 
@@ -196,15 +158,12 @@ Capabilities:
 - search_clinical_trials: ClinicalTrials.gov v2 API
 
 Behaviour:
-- Search for actively recruiting trials per relevant condition.
-- Up to 5 trials total.
-- PHI-safe: only condition strings transmitted externally.
+- Up to 5 trials. PHI-safe: only condition strings transmitted externally.
 - Include a `reason` on every tool call.
 
 Output JSON:
 {"trials": [{"nct_id": "<NCT>", "title": "<title>", "condition": "<cond>",
              "status": "<status>", "phase": "<phase>"}]}
-
 Do NOT propose observations.
 """
 
@@ -224,25 +183,12 @@ EVIDENCE_TRIALS_SUBAGENT = SubagentConfig(
 # ---------------------------------------------------------------------------
 # 3. Reasoning Agent
 # ---------------------------------------------------------------------------
-# Extended thinking. Synthesizes patient + evidence into clinical proposals.
-# No tool access — pure reasoning on provided context.
 
 REASONING_SYSTEM_PROMPT = """\
 You are the Clinical Reasoning component of a clinical AI governance system.
 Synthesize patient data and evidence into structured clinical reasoning and proposals.
 
 You have NO tool access. You reason only on the context provided.
-
-Reasoning framework:
-1. Patient profile: summarise demographics and observation history.
-2. Evidence alignment: match each observation to relevant guidelines.
-3. Gap analysis: identify observations clinically indicated but missing.
-4. Risk stratification: flag out-of-range values with clinical significance.
-5. Proposal rationale: for each proposed observation state:
-   - LOINC code and target value
-   - Guideline(s) supporting it
-   - Confidence level and rationale
-   - Potential contraindications or alternative explanations
 
 Output JSON:
 {
@@ -263,55 +209,27 @@ REASONING_SUBAGENT = SubagentConfig(
     name="reasoning",
     allowed_tools=[],
     system_prompt=REASONING_SYSTEM_PROMPT,
-    thinking={"type": "enabled", "budget_tokens": 8000},  # Overridden by plan
+    thinking={"type": "enabled", "budget_tokens": 8000},
 )
 
 
 # ---------------------------------------------------------------------------
 # 3.5. Refuter Agent  (sequential adversarial verification)
 # ---------------------------------------------------------------------------
-# Runs AFTER Reasoning, BEFORE Critic.
-# Gets proposals + raw evidence and tries to break every proposal.
-# Creates the antithesis to Reasoning\'s thesis.
-# Critic then resolves the dialectic (synthesis).
-#
-# NOT a parallel Devil\'s Advocate — deliberately sequential so the Refuter
-# sees the actual proposals, not a parallel guess.
 
 REFUTER_SYSTEM_PROMPT = """\
 You are the Refuter component of a clinical AI governance system.
-Your role is adversarial: given clinical proposals and the raw evidence that
-produced them, find every reason the proposals might be WRONG.
+Given clinical proposals and raw evidence, find every reason the proposals
+might be WRONG. You are NOT the final decision-maker — the Critic resolves.
 
-You have NO tool access. You reason only on the context provided.
+You have NO tool access.
 
-You are NOT the final decision-maker — the Critic resolves your attacks.
-You are NOT trying to be fair. You are generating the strongest possible counterargument.
-
-For each proposed observation, attack it across five vectors:
-
-1. Contradicting evidence
-   Find specific guideline text or thresholds that contradict this proposal.
-   Quote the contradicting evidence directly if present in the guidelines provided.
-
-2. Alternative explanations
-   What else could explain these observation values?
-   Is this proposal the most parsimonious clinical explanation?
-
-3. Confidence attack
-   Why is the assigned confidence score wrong?
-   Is it overconfident given population variance, lab error, or guideline uncertainty?
-
-4. Population confounders
-   What patient-specific factors (age, sex, comorbidities, medications) could
-   invalidate the general guideline that was cited?
-
-5. Procedural concerns
-   Could the value be erroneous due to lab error, transcription, sample timing,
-   or instrument calibration? Is there a safer observation to propose first?
-
-Mark each attack fatal=true if you believe it should BLOCK the proposal.
-The Critic will decide — mark liberally.
+For each proposal attack across:
+1. Contradicting evidence in the guidelines
+2. Alternative clinical explanations
+3. Confidence miscalibration
+4. Population-specific confounders (age, sex, comorbidities)
+5. Procedural concerns (lab error, transcription, timing)
 
 Output JSON:
 {
@@ -319,22 +237,17 @@ Output JSON:
   "attacks": [
     {
       "code": "<LOINC code>",
-      "contradicting_evidence": "<specific text or null>",
-      "alternative_explanation": "<most plausible alternative>",
+      "contradicting_evidence": "<text or null>",
+      "alternative_explanation": "<best alternative>",
       "confidence_attack": "<why confidence is wrong>",
-      "population_confounder": "<patient-specific factor or null>",
-      "procedural_concern": "<lab/transcription concern or null>",
+      "population_confounder": "<factor or null>",
+      "procedural_concern": "<concern or null>",
       "fatal": true
     }
   ],
-  "missed_proposals": ["<LOINC codes that should have been proposed but weren\'t>"],
-  "refuter_summary": "<what the Critic needs to know about these attacks>"
+  "missed_proposals": ["<LOINC codes>"],
+  "refuter_summary": "<what the Critic needs to know>"
 }
-
-verdict meanings:
-  all_survived  — no fatal attacks; all proposals pass adversarial review
-  some_survived — mix of fatal and non-fatal attacks
-  none_survived — all proposals have at least one fatal attack
 """
 
 REFUTER_SUBAGENT = SubagentConfig(
@@ -347,25 +260,12 @@ REFUTER_SUBAGENT = SubagentConfig(
 # ---------------------------------------------------------------------------
 # 4. Critic Agent
 # ---------------------------------------------------------------------------
-# Resolves the dialectic between Reasoning and Refuter.
-# Sees BOTH outputs and makes the synthesis verdict.
 
 CRITIC_SYSTEM_PROMPT = """\
 You are the Critic component of a clinical AI governance system.
-You receive two inputs:
-  1. Reasoning output  — the clinical proposals with evidence citations
-  2. Refuter output    — adversarial attacks on those proposals
+Resolve the dialectic between Reasoning (thesis) and Refuter (antithesis).
 
-Your role is synthesis: resolve the dialectic and produce a final verdict.
-For each proposal, weigh the Reasoning\'s evidence against the Refuter\'s attacks.
-
-You have NO tool access. You reason only on the context provided.
-
-For each proposal, decide:
-  - Did any of the Refuter\'s attacks survive scrutiny?
-  - Are the fatal attacks actually fatal, or are they overblown?
-  - What does the human reviewer most need to focus on?
-  - What is the final recommendation: approve | revise | reject?
+You have NO tool access.
 
 Output JSON:
 {
@@ -375,9 +275,9 @@ Output JSON:
     {
       "code": "<LOINC code>",
       "reasoning_strength": "strong | moderate | weak",
-      "refuter_attacks_sustained": ["<attack description if sustained>"],
-      "refuter_attacks_rejected": ["<attack description if rejected>"],
-      "confidence_adjustment": <-0.3 to 0.0>,  // negative only; Critic may lower confidence
+      "refuter_attacks_sustained": ["<description>"],
+      "refuter_attacks_rejected": ["<description>"],
+      "confidence_adjustment": <-0.3 to 0.0>,
       "recommendation": "approve | revise | reject",
       "reviewer_focus": "<what the human reviewer should examine>"
     }
@@ -396,7 +296,6 @@ CRITIC_SUBAGENT = SubagentConfig(
 # ---------------------------------------------------------------------------
 # 5. Compliance Agent
 # ---------------------------------------------------------------------------
-# Applies deterministic gate and stages proposals for human approval.
 
 COMPLIANCE_SYSTEM_PROMPT = """\
 You are the Compliance component of a clinical AI governance system.
@@ -406,16 +305,11 @@ Capabilities:
 - propose_observation: stage a validated observation for human approval
 - list_pending_writes: check what is already staged
 
-Invariants you must NEVER violate:
+Invariants:
 1. AGENTS PROPOSE. HUMANS APPROVE. Never call approve_write.
 2. Only stage proposals where Critic recommendation is approve or revise.
-   Do NOT stage proposals the Critic recommended reject.
-3. Include the Critic + Refuter summary in the `reason` field of every
-   propose_observation call. The human reviewer must see the full audit trail.
-4. Include a `reason` on every tool call. Reason is audited.
-
-reason format:
-  "[Critic: <verdict>] [Refuter: <attacks_sustained>] Confidence: <score> | Citations: <gl-ids>"
+3. Include Critic + Refuter summary in every propose_observation reason field.
+4. Include a `reason` on every tool call.
 
 Output JSON:
 {
@@ -437,10 +331,30 @@ COMPLIANCE_SUBAGENT = SubagentConfig(
 
 
 # ---------------------------------------------------------------------------
-# Backward-compatible aliases
+# Backward-compatible aliases and factory
 # ---------------------------------------------------------------------------
 
 READER_SUBAGENT = INTAKE_SUBAGENT
 RAG_SUBAGENT = EVIDENCE_RAG_SUBAGENT
 PROPOSAL_SUBAGENT = COMPLIANCE_SUBAGENT
 PROPOSAL_SUBAGENT_THINKING = REASONING_SUBAGENT
+
+
+def make_proposal_subagent(use_extended_thinking: bool = False) -> SubagentConfig:
+    """Backward-compatible factory.
+
+    Returns a SubagentConfig equivalent to the old ProposalSubagent.
+    Extended thinking is implemented by the Reasoning stage in the new
+    7-agent architecture; this shim exists so existing tests and callers
+    that depend on the old 3-agent API continue to work unchanged.
+    """
+    return SubagentConfig(
+        name="proposal",
+        allowed_tools=["propose_observation"],
+        system_prompt=COMPLIANCE_SYSTEM_PROMPT,
+        thinking=(
+            {"type": "enabled", "budget_tokens": 5000}
+            if use_extended_thinking
+            else None
+        ),
+    )
