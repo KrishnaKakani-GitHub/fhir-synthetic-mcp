@@ -1,13 +1,13 @@
 """FHIR MCP server — Clinical AI Governance Platform.
 
 This is the file Claude Code and the Agent SDK launch. It defines:
-  - 8 tools (3 read, 4 write-gate, 1 RAG search)
+  - 9 tools (3 read, 4 write-gate, 1 RAG search, 1 ClinicalTrials.gov)
   - 2 MCP resources (fhir://patient/{id}/summary, fhir://guidelines/index)
   - 2 MCP prompts (review_pending, patient_overview)
 
 Each tool:
   1. Verifies the caller's identity (auth layer)
-  2. Delegates to the store / RAG
+  2. Delegates to the store / RAG / trials client
   3. Emits a tamper-evident audit record on both success and error paths
 
 Prompt caching: the system block and the guidelines block are marked
@@ -18,7 +18,7 @@ clinical flag threshold, the orchestrator routes the Proposal Subagent
 into extended thinking mode (budget_tokens=5000) before finalising.
 
 The write gate invariant is preserved:
-  - Agents can READ, SEARCH, and PROPOSE
+  - Agents can READ, SEARCH, PROPOSE, and LOOK UP TRIALS
   - Only a verified human approver can COMMIT via approve_write
 
 Run locally:   python -m fhir_mcp.server
@@ -39,6 +39,7 @@ from .auth import AuthError, verify_agent_actor, verify_approver
 from .models import ProposedObservation
 from .rag import get_rag
 from .store import FhirStore, StoreError
+from .trials import search_trials_for_condition
 from .validator import get_rules
 
 _DB_PATH = Path(
@@ -146,7 +147,6 @@ def search_guidelines(
             "result_count": len(results),
         },
     )
-    # Return scores + guideline metadata (no embeddings)
     return [
         {
             "rank": r["rank"],
@@ -161,6 +161,60 @@ def search_guidelines(
         }
         for r in results
     ]
+
+
+# --- ClinicalTrials.gov tool --------------------------------------------------
+
+
+@mcp.tool()
+def search_clinical_trials(
+    condition: str,
+    loinc_codes: str = "",
+    max_results: int = 5,
+    reason: str = "",
+) -> list[dict]:
+    """Search ClinicalTrials.gov for recruiting trials matching a condition.
+
+    Call this when search_guidelines returns results with validation_warnings
+    (i.e. flagged observations) to surface trials the patient may qualify for.
+    Only condition strings are sent externally — no patient identifiers.
+
+    Args:
+        condition:    Clinical condition (e.g. 'hypertension', 'type 2 diabetes').
+        loinc_codes:  Optional comma-separated LOINC codes to enrich the search
+                      (e.g. '55284-4' maps to 'hypertension').
+        max_results:  Max trials to return (default 5, max 10).
+        reason:       Why you are searching (audited).
+
+    PHI NOTE: No patient identifiers are sent to ClinicalTrials.gov.
+    Only the condition string is transmitted externally.
+    """
+    try:
+        verify_agent_actor(_AGENT_ACTOR)
+    except AuthError as e:
+        audit(actor=_AGENT_ACTOR, action="search_clinical_trials", reason=reason,
+              outcome="error", extra={"error": str(e)})
+        raise
+
+    max_results = min(max(1, max_results), 10)
+    codes = [c.strip() for c in loinc_codes.split(",") if c.strip()]
+
+    trials = search_trials_for_condition(
+        condition=condition,
+        loinc_codes=codes or None,
+        max_results=max_results,
+    )
+
+    audit(
+        actor=_AGENT_ACTOR, action="search_clinical_trials", reason=reason,
+        extra={
+            "condition": condition[:120],
+            "loinc_codes": codes,
+            "result_count": len(trials),
+            "phi_transmitted": False,
+        },
+    )
+    return trials
 
 
 # --- Gated write tools --------------------------------------------------------
@@ -267,11 +321,7 @@ def reject_write(write_id: str, approver: str, reason: str) -> dict:
 
 @mcp.resource("fhir://patient/{patient_id}/summary")
 def patient_summary(patient_id: str) -> str:
-    """FHIR patient summary as structured text.
-
-    Returns demographics + all observations for a patient. Designed for
-    use as context in agent prompts (prompt caching friendly).
-    """
+    """FHIR patient summary as structured text."""
     try:
         verify_agent_actor(_AGENT_ACTOR)
         patient = store.get_patient(patient_id)
@@ -302,11 +352,7 @@ def patient_summary(patient_id: str) -> str:
 
 @mcp.resource("fhir://guidelines/index")
 def guidelines_index() -> str:
-    """Index of available clinical guidelines (titles + LOINC codes).
-
-    Use this to discover what guidelines are available before calling
-    search_guidelines with a targeted query.
-    """
+    """Index of available clinical guidelines (titles + LOINC codes)."""
     rag = get_rag()
     lines = ["Clinical Guidelines Index:", ""]
     for g in rag._guidelines:
@@ -322,11 +368,7 @@ def guidelines_index() -> str:
 
 @mcp.prompt()
 def review_pending() -> list[dict[str, Any]]:
-    """Prompt template for a human reviewer approving/rejecting pending writes.
-
-    Returns an Anthropic messages array with a cacheable system block
-    and a human turn requesting review of the pending queue.
-    """
+    """Prompt template for a human reviewer approving/rejecting pending writes."""
     rules = get_rules()
     rule_summary = json.dumps(
         {

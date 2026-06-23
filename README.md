@@ -17,6 +17,7 @@ A production-grade reference implementation for deploying LLM agents over clinic
 * Day 5 ✓ — Clinical NLP entity extraction + calibrated confidence scoring
 * Day 6 ✓ — Eval harness: golden dataset, LLM-as-judge, GitHub Actions CI
 * Day 7 ✓ — HTTP server (FastAPI SSE), Dockerfile, Railway deploy
+* Day 8 ✓ — ClinicalTrials.gov integration: surface recruiting trials on flagged observations
 
 ## Architecture
 
@@ -31,8 +32,7 @@ A production-grade reference implementation for deploying LLM agents over clinic
 │  └────────────┘  └────────────┘  └───────────────┘              │
 │  PostToolUse hooks: audit + cost/latency tracking                  │
 │                                                                    │
-│  MCP Server  (FastMCP 3.x)  stdio (local) / SSE (remote)          │
-│  8 tools · 2 resources · 2 prompts                                │
+│  MCP Server  (FastMCP 3.x)  9 tools · 2 resources · 2 prompts     │
 │                                                                    │
 │  Deterministic Validation  (validator.py)                         │
 │  LOINC registry · value ranges · unit enforcement                 │
@@ -41,6 +41,10 @@ A production-grade reference implementation for deploying LLM agents over clinic
 │  │ SQLite Store  │  │ ChromaDB RAG   │  │ Audit Chain     │ │
 │  │ WAL · FK      │  │ BM25 + Semantic│  │ SHA-256 JSONL   │ │
 │  └────────────────┘  └────────────────┘  └─────────────────┘ │
+│                                                                    │
+│  ClinicalTrials.gov v2 API (trials.py)                            │
+│  Surfaces recruiting trials on flagged observations               │
+│  PHI-safe: only condition strings transmitted externally           │
 │                                                                    │
 │  Eval Harness (evals/) · 25 golden cases · LLM-as-judge           │
 └──────────────────────────────────────────────────────────────────────┘
@@ -65,6 +69,7 @@ A production-grade reference implementation for deploying LLM agents over clinic
 | GitHub Actions CI (pytest + eval regression gate) | ✓ Day 6 |
 | HTTP server (FastAPI SSE, claude.ai connector) | ✓ Day 7 |
 | Dockerfile + Railway deploy | ✓ Day 7 |
+| ClinicalTrials.gov integration (flagged observation → trial search) | ✓ Day 8 |
 
 ## Performance (eval harness, smoke suite)
 
@@ -130,7 +135,7 @@ python3 scripts/run_evals.py --suite full --judge
 ```
 src/
   fhir_mcp/
-    server.py        # FastMCP tools + resources + prompts
+    server.py        # FastMCP 9 tools + resources + prompts
     store.py         # SQLite store (only PHI touchpoint)
     models.py        # Pydantic v2 FHIR models
     audit.py         # SHA-256 hash-chain audit
@@ -139,6 +144,7 @@ src/
     rag.py           # BM25 + ChromaDB hybrid RAG
     nlp.py           # Clinical NLP entity extraction
     confidence.py    # Calibrated confidence scoring
+    trials.py        # ClinicalTrials.gov v2 API client
     http_server.py   # FastAPI SSE transport
   clinical_agent/
     orchestrator.py  # ClinicalOrchestrator (3-subagent workflow)
