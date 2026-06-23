@@ -6,7 +6,17 @@ A production-grade reference implementation for deploying LLM agents over clinic
 
 **Live demo:** `https://clinical-ai-governance-platform-production.up.railway.app`
 
-[![CI](https://github.com/KrishnaKakani-GitHub/fhir-synthetic-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/KrishnaKakani-GitHub/fhir-synthetic-mcp/actions)
+[![CI](https://github.com/KrishnaKakani-GitHub/clinical-ai-governance-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/KrishnaKakani-GitHub/clinical-ai-governance-platform/actions)
+
+## Day-by-day build plan
+
+* Day 1 ✓ — SQLite store, tamper-evident audit, auth layer
+* Day 2 ✓ — LOINC validator + clinical data (guidelines, notes)
+* Day 3 ✓ — RAG: BM25 + ChromaDB hybrid over clinical guidelines
+* Day 4 ✓ — Agent SDK orchestration (Reader/RAG/Proposal subagents, hooks)
+* Day 5 ✓ — Clinical NLP entity extraction + calibrated confidence scoring
+* Day 6 ✓ — Eval harness: golden dataset, LLM-as-judge, GitHub Actions CI
+* Day 7 ✓ — HTTP server (FastAPI SSE), Dockerfile, Railway deploy
 
 ## Architecture
 
@@ -104,7 +114,7 @@ Settings → Connectors → Add → `https://clinical-ai-governance-platform-pro
 ## Verify audit chain
 
 ```bash
-python scripts/audit_verify.py data/audit.jsonl
+python3 scripts/audit_verify.py data/audit.jsonl
 ```
 
 ## Run evals
