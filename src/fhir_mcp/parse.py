@@ -23,17 +23,15 @@ API: NVIDIA NIM (OpenAI-compatible)
 
 NIM constraints:
   - Exactly one user message per request (no system message)
-  - Content must be image-only (no text content items)
-  - PDFs must be converted to PNG images first (JPEG/PNG/BMP/TIFF/WEBP only)
+  - Image-only content (no text content items)
+  - PDFs must be converted to PNG images first
 
 PDFs are rendered page-by-page via pypdfium2; each page is a separate call.
 
-For PHI compliance, deploy NIM self-hosted on-premises so no document
-content leaves your infrastructure. The cloud NIM endpoint is suitable
-for synthetic or de-identified documents only.
+For PHI compliance, set NEMOTRON_PARSE_BASE_URL to a self-hosted NIM
+endpoint so document content stays on-premises.
 
-PHI NOTE: If NVIDIA_API_KEY is set and documents contain PHI, use the
-self-hosted NIM endpoint (NEMOTRON_PARSE_BASE_URL env var).
+PHI NOTE: Cloud NIM endpoint is for synthetic/de-identified documents only.
 """
 from __future__ import annotations
 
@@ -137,18 +135,19 @@ def _pdf_to_page_images(pdf_bytes: bytes) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# NIM API call — image-only, single user message
+# NIM API call — image-only, single user message, no system message
 # ---------------------------------------------------------------------------
 
 
 def _call_nim_api(image_b64: str) -> tuple[str, int, int]:
     """Send one base64 PNG to Nemotron Parse NIM.
 
-    NIM constraints enforced here:
-      - Single user message (no system message)
-      - Image-only content (no text items permitted)
+    NIM constraints:
+      - Single user message (no system message allowed)
+      - Image-only content (no text items allowed)
 
     Returns (structured_text, input_tokens, output_tokens).
+    structured_text is always a str (empty string if NIM returns None).
     """
     payload = json.dumps({
         "model": _MODEL,
@@ -185,12 +184,14 @@ def _call_nim_api(image_b64: str) -> tuple[str, int, int]:
         body = e.read().decode(errors="replace")
         raise RuntimeError(f"Nemotron Parse API error {e.code}: {body}") from e
 
-    text = (
+    # Guard: content may be None if NIM returns an empty response
+    text: str = (
         data.get("choices", [{}])[0]
         .get("message", {})
-        .get("content", "")
+        .get("content") or ""
     )
     usage = data.get("usage", {})
+    _logger.debug("NIM raw response keys: %s", list(data.keys()))
     return text, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
 
 
@@ -207,9 +208,8 @@ def parse_document(
 
     Args:
         source: Local file path, public image URL, or raw bytes (PDF or image).
-        document_type: Informational hint stored in ParseResult metadata.
-                       One of: 'clinical', 'prior_auth', 'eob',
-                       'treatment_plan', 'lab_report'
+        document_type: Metadata hint. One of:
+          'clinical', 'prior_auth', 'eob', 'treatment_plan', 'lab_report'
 
     Returns:
         ParseResult with structured_text (markdown).
@@ -217,8 +217,8 @@ def parse_document(
     PDFs are rendered page-by-page; each page is a separate NIM call.
     Results are concatenated with page markers.
 
-    PHI NOTE: content sent to NVIDIA NIM cloud. Use NEMOTRON_PARSE_BASE_URL
-    to point at a self-hosted NIM endpoint for PHI documents.
+    PHI NOTE: Content sent to NVIDIA NIM cloud unless NEMOTRON_PARSE_BASE_URL
+    is set to a self-hosted endpoint. Use self-hosted for PHI documents.
     """
     if not _NVIDIA_API_KEY:
         _logger.warning(
