@@ -21,9 +21,8 @@ API: NVIDIA NIM (OpenAI-compatible)
   Model: nvidia/nemotron-parse
   Auth:  NVIDIA_API_KEY environment variable
 
-NIM accepts one image per request.
-PDFs are rendered to per-page PNG images via pypdfium2; each page is
-sent as a separate NIM call and results are concatenated.
+NIM constraint: exactly one user message per request, no system message.
+PDFs are rendered page-by-page via pypdfium2; each page is a separate call.
 
 For PHI compliance, deploy NIM self-hosted on-premises so no document
 content leaves your infrastructure. The cloud NIM endpoint is suitable
@@ -55,9 +54,9 @@ _MODEL = "nvidia/nemotron-parse"
 _TIMEOUT = 60
 _MAX_PAGES = 10
 
-_PARSE_SYSTEM_PROMPT = (
+_USER_PROMPT = (
     "You are a clinical document parser. Extract and structure all content "
-    "from the provided document. Preserve table structure as markdown tables. "
+    "from this document page. Preserve table structure as markdown tables. "
     "Maintain reading order. Extract: patient demographics, diagnosis codes, "
     "procedure codes, medication lists, authorization decisions, dates, and "
     "provider information. Output clean, structured markdown."
@@ -114,9 +113,8 @@ def _download_url(url: str) -> bytes:
 
 
 def _pdf_to_page_images(pdf_bytes: bytes) -> list[str]:
-    """Render PDF pages to base64 PNG strings (one per page) via pypdfium2.
+    """Render PDF pages to base64 PNG strings via pypdfium2.
 
-    pypdfium2 is a pure-Python wheel with bundled libpdfium.
     Install: pip install pypdfium2 Pillow
     """
     try:
@@ -143,20 +141,23 @@ def _pdf_to_page_images(pdf_bytes: bytes) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# NIM API call (one image per request)
+# NIM API call — exactly one user message, no system message
 # ---------------------------------------------------------------------------
 
 
-def _call_nim_api(image_b64: str, system_prompt: str) -> tuple[str, int, int]:
-    """Send one base64 PNG image to Nemotron Parse NIM.
+def _call_nim_api(image_b64: str, document_type: str) -> tuple[str, int, int]:
+    """Send one base64 PNG to Nemotron Parse NIM.
+
+    NIM constraint: messages array must contain exactly one user message.
+    No system message is permitted.
 
     Returns (structured_text, input_tokens, output_tokens).
-    Raises RuntimeError on API error.
     """
+    user_text = f"{_USER_PROMPT} Document type: {document_type}."
+
     payload = json.dumps({
         "model": _MODEL,
         "messages": [
-            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": [
@@ -166,7 +167,7 @@ def _call_nim_api(image_b64: str, system_prompt: str) -> tuple[str, int, int]:
                     },
                     {
                         "type": "text",
-                        "text": "Parse this document page and return structured markdown.",
+                        "text": user_text,
                     },
                 ],
             },
@@ -220,9 +221,9 @@ def parse_document(
     Returns:
         ParseResult with structured_text (markdown).
 
-    PDFs are rendered page-by-page via pypdfium2; each page is sent as a
-    separate NIM request (NIM accepts one image per call) and results
-    are concatenated with page separators.
+    PDFs are rendered page-by-page via pypdfium2; each page is a separate
+    NIM call (NIM accepts exactly one user message per request).
+    Results are concatenated with page markers.
 
     PHI NOTE: content sent to NVIDIA NIM cloud. Use NEMOTRON_PARSE_BASE_URL
     to point at a self-hosted NIM endpoint for PHI documents.
@@ -234,19 +235,14 @@ def parse_document(
         )
         return _fallback_parse(source)
 
-    system_prompt = f"{_PARSE_SYSTEM_PROMPT} Document type: {document_type}."
-
-    # Resolve source to list of base64 PNG strings (one per page/image)
+    # Resolve source to base64 PNG list (one per page)
     page_b64s: list[str] = []
 
     if isinstance(source, str) and source.startswith("http"):
         if _is_pdf(source):
-            pdf_bytes = _download_url(source)
-            page_b64s = _pdf_to_page_images(pdf_bytes)
+            page_b64s = _pdf_to_page_images(_download_url(source))
         else:
-            # Direct image URL: download and encode
-            img_bytes = _download_url(source)
-            page_b64s = [base64.b64encode(img_bytes).decode()]
+            page_b64s = [base64.b64encode(_download_url(source)).decode()]
 
     elif isinstance(source, (str, Path)) and not str(source).startswith("http"):
         path = Path(source)
@@ -270,26 +266,25 @@ def parse_document(
     if not page_b64s:
         return _fallback_parse(source)
 
-    # Call NIM once per page, concatenate results
+    # One NIM call per page
     page_texts: list[str] = []
     total_input = 0
     total_output = 0
 
     for i, b64 in enumerate(page_b64s):
         try:
-            text, inp, out = _call_nim_api(b64, system_prompt)
+            text, inp, out = _call_nim_api(b64, document_type)
             page_texts.append(f"<!-- page {i + 1} -->\n{text}")
             total_input += inp
             total_output += out
-            _logger.info("Page %d/%d parsed: %d words", i + 1, len(page_b64s), len(text.split()))
+            _logger.info("Page %d/%d: %d words", i + 1, len(page_b64s), len(text.split()))
         except (RuntimeError, urllib.error.URLError, TimeoutError) as e:
             _logger.warning("Page %d failed: %s — skipping", i + 1, e)
             page_texts.append(f"<!-- page {i + 1}: parse failed -->")
 
     structured_text = "\n\n".join(page_texts)
-
     _logger.info(
-        "Nemotron Parse complete: pages=%d total_words=%d input_tokens=%d",
+        "Nemotron Parse complete: pages=%d words=%d input_tokens=%d",
         len(page_b64s), len(structured_text.split()), total_input,
     )
 
@@ -301,18 +296,6 @@ def parse_document(
         parse_method="nemotron_parse_nim",
         page_count=len(page_b64s),
     )
-
-
-def _infer_media_type(path: Path) -> str:
-    return {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".tiff": "image/tiff",
-        ".tif": "image/tiff",
-        ".bmp": "image/bmp",
-        ".webp": "image/webp",
-    }.get(path.suffix.lower(), "image/png")
 
 
 def _fallback_parse(source: str | Path | bytes) -> ParseResult:
