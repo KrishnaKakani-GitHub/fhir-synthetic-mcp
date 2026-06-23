@@ -1,17 +1,22 @@
 """Data store: SQLite backend with deterministic validation gate.
 
 Same public interface as v1 (FhirStore). The write gate
-(propose → stage → approve/reject) is unchanged — only the
-persistence layer is replaced and validator.py is now called.
+(propose → stage → approve/reject) is unchanged.
 
 Design decisions:
 - sqlite3 stdlib only (no ORM, no external deps)
-- WAL mode: concurrent reads don't block writes
+- WAL mode: concurrent reads don\'t block writes
 - Foreign keys: prevents orphaned observations
 - Pending writes are in-memory only (intentional) — proposals are
   never persisted until a human approves them
-- validator.validate_observation() is called in stage_write() before
-  the proposal enters the queue — this is the deterministic gate
+- validator.validate_observation() called in stage_write() — deterministic gate
+
+Field-level encryption (PHI at rest):
+- Set FHIR_MCP_ENCRYPTION_KEY to a Fernet key to encrypt PHI fields.
+- Encrypted fields: name, mrn, birth_date (all directly identifying).
+- Observation values/codes are not encrypted (clinical, not identifying).
+- Generate a key: python -c "from fhir_mcp.store import generate_encryption_key; print(generate_encryption_key())"
+- Dev mode: encryption off when key not set. Never run dev mode with real PHI.
 
 PHI NOTE: All PHI touchpoints are in this module only. The store
 deliberately never logs record contents — that responsibility lives
@@ -19,6 +24,8 @@ in audit.py (IDs only).
 """
 from __future__ import annotations
 
+import logging
+import os
 import sqlite3
 import threading
 import uuid
@@ -35,9 +42,73 @@ from .models import (
 )
 from .validator import ValidationError, validate_observation
 
+_logger = logging.getLogger("fhir_mcp.store")
+_ENCRYPTION_KEY = os.environ.get("FHIR_MCP_ENCRYPTION_KEY", "").strip()
+
 
 class StoreError(Exception):
     """Raised for store-level problems (missing records, invalid state)."""
+
+
+# ---------------------------------------------------------------------------
+# Field-level encryption helpers
+# ---------------------------------------------------------------------------
+
+
+def generate_encryption_key() -> str:
+    """Generate a new Fernet encryption key. Run once; store securely.
+
+    Usage::
+
+        python -c "from fhir_mcp.store import generate_encryption_key; print(generate_encryption_key())"
+
+    Save the output as FHIR_MCP_ENCRYPTION_KEY in your secrets manager.
+    Losing this key means losing access to all encrypted PHI records.
+    """
+    from cryptography.fernet import Fernet
+    return Fernet.generate_key().decode()
+
+
+def _get_fernet():
+    """Return a Fernet instance if encryption key is set, else None."""
+    if not _ENCRYPTION_KEY:
+        return None
+    try:
+        from cryptography.fernet import Fernet
+        key = _ENCRYPTION_KEY.encode() if isinstance(_ENCRYPTION_KEY, str) else _ENCRYPTION_KEY
+        return Fernet(key)
+    except Exception as e:
+        _logger.error("Failed to initialise Fernet encryption: %s", e)
+        raise
+
+
+def _encrypt(value: str) -> str:
+    """Encrypt a PHI string field. Returns plaintext if no key set (dev mode)."""
+    f = _get_fernet()
+    if f is None:
+        return value
+    return f.encrypt(value.encode()).decode()
+
+
+def _decrypt(value: str) -> str:
+    """Decrypt a PHI string field. Returns value unchanged if no key set.
+
+    Handles migration: if value is already plaintext (pre-encryption records)
+    decryption fails gracefully and the raw value is returned.
+    """
+    f = _get_fernet()
+    if f is None:
+        return value
+    try:
+        return f.decrypt(value.encode()).decode()
+    except Exception:
+        _logger.warning("Decryption failed — returning raw value (plaintext migration?)")
+        return value
+
+
+# ---------------------------------------------------------------------------
+# FhirStore
+# ---------------------------------------------------------------------------
 
 
 class FhirStore:
@@ -46,17 +117,22 @@ class FhirStore:
     A threading lock guards mutations. The pending-write queue is
     intentionally in-memory only — unapproved proposals are never
     persisted, so they cannot leak into the database on restart.
+
+    PHI fields (name, mrn, birth_date) are encrypted at rest when
+    FHIR_MCP_ENCRYPTION_KEY is set.
     """
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
         self._lock = threading.Lock()
         self._pending: dict[str, PendingWrite] = {}
+        if _ENCRYPTION_KEY:
+            _logger.info("Field-level encryption enabled for PHI fields")
+        else:
+            _logger.warning(
+                "FHIR_MCP_ENCRYPTION_KEY not set — PHI stored in plaintext (dev mode)"
+            )
         self._init_db()
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
@@ -110,10 +186,16 @@ class FhirStore:
             ).fetchone()
         if row is None:
             raise StoreError(f"Unknown patient_id: {patient_id}")
-        return Patient(**dict(row))
+        return Patient(
+            id=row["id"],
+            name=_decrypt(row["name"]),
+            birth_date=_decrypt(row["birth_date"]),
+            gender=row["gender"],
+            mrn=_decrypt(row["mrn"]),
+        )
 
     def list_observations(self, patient_id: str) -> list[Observation]:
-        self.get_patient(patient_id)  # raises StoreError if unknown
+        self.get_patient(patient_id)
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM observations WHERE patient_id = ? ORDER BY effective_date",
@@ -137,23 +219,13 @@ class FhirStore:
     # ------------------------------------------------------------------
 
     def stage_write(self, proposed: ProposedObservation) -> PendingWrite:
-        """Stage a proposed observation. Does NOT commit. Returns the ticket.
-
-        Deterministic validation order:
-          1. Patient exists check (structural)
-          2. Negative value guard (basic sanity)
-          3. Non-empty code check (basic sanity)
-          4. LOINC registry + value range + unit (clinical)
-
-        Any failure raises StoreError. The proposal never enters the queue.
-        """
-        self.get_patient(proposed.patient_id)  # patient must exist
+        """Stage a proposed observation. Does NOT commit. Returns the ticket."""
+        self.get_patient(proposed.patient_id)
         if proposed.value < 0:
             raise StoreError("Observation value cannot be negative.")
         if not proposed.code.strip():
             raise StoreError("Observation code is required.")
 
-        # Deterministic clinical validation gate
         result = validate_observation(proposed)
         if not result.ok:
             raise StoreError(
@@ -188,9 +260,7 @@ class FhirStore:
         with self._lock:
             pending = self.get_pending(write_id)
             if pending.status != PendingWriteStatus.pending:
-                raise StoreError(
-                    f"Write {write_id} already {pending.status.value}."
-                )
+                raise StoreError(f"Write {write_id} already {pending.status.value}.")
             obs = Observation(
                 id=f"obs-{uuid.uuid4().hex[:8]}",
                 patient_id=pending.proposed.patient_id,
@@ -221,9 +291,7 @@ class FhirStore:
         with self._lock:
             pending = self.get_pending(write_id)
             if pending.status != PendingWriteStatus.pending:
-                raise StoreError(
-                    f"Write {write_id} already {pending.status.value}."
-                )
+                raise StoreError(f"Write {write_id} already {pending.status.value}.")
             pending.status = PendingWriteStatus.rejected
             pending.decided_at = datetime.now(timezone.utc)
             pending.decided_by = approver
@@ -234,10 +302,10 @@ class FhirStore:
     # ------------------------------------------------------------------
 
     def import_from_json(self, json_path: Path) -> None:
-        """Seed the database from the legacy JSON fixture.
+        """Seed the database from the JSON fixture.
 
-        Uses INSERT OR IGNORE so it is safe to re-run against an
-        already-populated database.
+        Uses INSERT OR IGNORE so it is safe to re-run.
+        PHI fields are encrypted if FHIR_MCP_ENCRYPTION_KEY is set.
         """
         import json
         raw = json.loads(json_path.read_text(encoding="utf-8"))
@@ -248,7 +316,13 @@ class FhirStore:
                     """INSERT OR IGNORE INTO patients
                        (id, name, birth_date, gender, mrn)
                        VALUES (?, ?, ?, ?, ?)""",
-                    (p.id, p.name, str(p.birth_date), p.gender.value, p.mrn),
+                    (
+                        p.id,
+                        _encrypt(p.name),
+                        _encrypt(str(p.birth_date)),
+                        p.gender.value,
+                        _encrypt(p.mrn),
+                    ),
                 )
             for o in data.observations:
                 conn.execute(

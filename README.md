@@ -16,6 +16,9 @@ Raw PDF / prior auth letter / treatment plan
   parse_clinical_document  (Nemotron Parse — NVIDIA NIM)
   Multi-column OCR, table extraction, reading-order reconstruction
   ↓
+  de-identification layer  (deidentify.py)
+  Strip name/MRN, hash patient ID, bucket age — before any external API
+  ↓
   extract_entities  (ClinicalNLP — Anthropic structured output, temp=0)
   ICD-10-CM · LOINC · NPI · RxNorm · calibrated confidence
   ↓
@@ -29,9 +32,9 @@ Raw PDF / prior auth letter / treatment plan
   Hard reject on impossible values · warning on clinical flags
   ↓
   ═ HUMAN-IN-THE-LOOP GATE ═
-  approve_write / reject_write  (verified approver only)
+  approve_write / reject_write  (verified approver only, DUA-gated)
   ↓
-  SQLite commit  (WAL mode, FK enforcement)
+  SQLite commit  (WAL mode, FK enforcement, field-level encryption)
   ↓
   SHA-256 audit chain  (tamper-evident JSONL, verify_chain())
 ```
@@ -47,6 +50,7 @@ Raw PDF / prior auth letter / treatment plan
 * Day 7 ✓ — HTTP server (FastAPI SSE), Dockerfile, Railway deploy
 * Day 8 ✓ — ClinicalTrials.gov integration: surface recruiting trials on flagged observations
 * Day 9 ✓ — Nemotron Parse: raw PDF → structured text → NLP → validation → audit
+* Day 10 ✓ — PHI infrastructure: DUA enforcement, field-level encryption, de-identification layer
 
 ## Architecture
 
@@ -54,8 +58,12 @@ Raw PDF / prior auth letter / treatment plan
 ┌──────────────────────────────────────────────────────────────────────┐
 │           Clinical AI Governance Platform                          │
 │                                                                    │
-│  [IN]  Nemotron Parse (NVIDIA NIM)                                │
+│  [IN]  Nemotron Parse (NVIDIA NIM / self-hosted for PHI)          │
 │  Raw PDF → structured markdown (prior auth, EOB, treatment plan)  │
+│                        │                                           │
+│                        ▼                                           │
+│  De-identification layer  (deidentify.py)                         │
+│  Hash patient ID · strip name/MRN · bucket age                    │
 │                        │                                           │
 │                        ▼                                           │
 │  Agent SDK Orchestration  (src/clinical_agent/)                   │
@@ -70,9 +78,13 @@ Raw PDF / prior auth letter / treatment plan
 │  Deterministic Validation  (validator.py)                         │
 │  LOINC registry · value ranges · unit enforcement                 │
 │                                                                    │
+│  Auth + DUA layer  (auth.py)                                      │
+│  Principal · Approver · Data Use Agreement verification           │
+│                                                                    │
 │  ┌────────────────┐  ┌────────────────┐  ┌─────────────────┐ │
 │  │ SQLite Store  │  │ ChromaDB RAG   │  │ Audit Chain     │ │
 │  │ WAL · FK      │  │ BM25 + Semantic│  │ SHA-256 JSONL   │ │
+│  │ Fernet enc.   │  │ RRF fusion     │  │ verify_chain()  │ │
 │  └────────────────┘  └────────────────┘  └─────────────────┘ │
 │                                                                    │
 │  ClinicalTrials.gov v2 · Eval Harness (25 cases, LLM-as-judge)   │
@@ -100,6 +112,9 @@ Raw PDF / prior auth letter / treatment plan
 | Dockerfile + Railway deploy | ✓ Day 7 |
 | ClinicalTrials.gov integration (flagged obs → trial search) | ✓ Day 8 |
 | Nemotron Parse — raw PDF → structured text → NLP → audit | ✓ Day 9 |
+| DUA enforcement (FHIR_MCP_PHI_MODE=strict) | ✓ Day 10 |
+| Field-level encryption at rest (Fernet, PHI fields) | ✓ Day 10 |
+| De-identification layer (hash ID, strip name/MRN, age bucket) | ✓ Day 10 |
 
 ## Performance (eval harness, smoke suite)
 
@@ -139,6 +154,9 @@ Settings → Connectors → Add → `https://clinical-ai-governance-platform-pro
 | `ANTHROPIC_API_KEY` | — | Required for Agent SDK + NLP |
 | `NVIDIA_API_KEY` | — | Required for Nemotron Parse (NVIDIA NIM) |
 | `NEMOTRON_PARSE_BASE_URL` | NIM cloud | Override with self-hosted NIM URL for PHI docs |
+| `FHIR_MCP_PHI_MODE` | off | Set `strict` to enable DUA enforcement |
+| `FHIR_MCP_ENCRYPTION_KEY` | — | Fernet key for PHI field encryption at rest |
+| `FHIR_MCP_DUAS` | — | Comma-separated actor IDs with signed DUA |
 | `FHIR_MCP_DB` | `data/fhir.db` | SQLite database path |
 | `FHIR_MCP_ACTOR` | `agent:dev` | Agent audit identity |
 | `FHIR_MCP_AUDIT_FILE` | stderr | Audit JSONL path |
@@ -147,6 +165,14 @@ Settings → Connectors → Add → `https://clinical-ai-governance-platform-pro
 | `FHIR_MCP_APPROVERS` | *(unset = dev mode)* | Allowed human approver IDs |
 | `FHIR_MCP_RAG_DISABLE_CHROMA` | `0` | Set `1` in CI (BM25-only mode) |
 | `PORT` | `8080` | HTTP server port |
+
+## Generate an encryption key
+
+```bash
+python3 -c "from fhir_mcp.store import generate_encryption_key; print(generate_encryption_key())"
+```
+
+Store the output in your secrets manager as `FHIR_MCP_ENCRYPTION_KEY`.
 
 ## Verify audit chain
 
@@ -167,11 +193,12 @@ python3 scripts/run_evals.py --suite full --judge
 src/
   fhir_mcp/
     server.py        # FastMCP 10 tools + resources + prompts
-    store.py         # SQLite store (only PHI touchpoint)
+    store.py         # SQLite store + field-level encryption (only PHI touchpoint)
     models.py        # Pydantic v2 FHIR models
     audit.py         # SHA-256 hash-chain audit
-    auth.py          # Principal + approver verification
+    auth.py          # Principal + approver + DUA verification
     validator.py     # LOINC deterministic gate
+    deidentify.py    # De-identification layer (hash ID, strip PHI, age bucket)
     rag.py           # BM25 + ChromaDB hybrid RAG
     nlp.py           # Clinical NLP entity extraction
     confidence.py    # Calibrated confidence scoring
@@ -202,11 +229,3 @@ docs/
   scale.md         # Portfolio deployment playbook
   ci.md            # GitHub Actions setup
 ```
-
-## Architecture deep-dive
-
-See [docs/architecture.md](docs/architecture.md).
-
-## Portfolio scaling
-
-See [docs/scale.md](docs/scale.md).
