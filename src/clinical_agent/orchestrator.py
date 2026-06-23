@@ -6,32 +6,11 @@ Architecture (Day 12):
   Stage 1  Intake       — Nemotron Parse → NLP → patient entities
   Stage 2  Evidence     — RAG + ClinicalTrials.gov IN PARALLEL
   Stage 3  Reasoning    — Extended thinking, synthesizes patient + evidence
-  Stage 3.5 Refuter     — Adversarial attack: breaks proposals before Critic sees them
+  Stage 3.5 Refuter     — Adversarial attack: breaks proposals before Critic
   Stage 4  Critic       — Thesis/antithesis → synthesis (Reasoning vs Refuter)
   Stage 5  Compliance   — Deterministic LOINC gate + DUA + propose_observation
                                 ↓
                            human gate (approve_write)
-
-Key features:
-
-  Dynamic planning:  Planner runs before Intake and decides which stages to
-                     run and with what settings. Simple lab rechecks skip
-                     extended thinking and trials search. simple_query fast-paths
-                     directly to Compliance with no proposals.
-
-  Sequential Refuter: Runs AFTER Reasoning, BEFORE Critic. Gets proposals +
-                      raw evidence and tries to break every proposal (thesis
-                      → antithesis). Critic resolves the dialectic (synthesis).
-                      NOT parallel — Refuter needs the actual proposals.
-
-  Checkpointing:     Each stage output is persisted to disk after completion.
-                     Interrupted workflows resume from the last completed stage
-                     by passing checkpoint_id to run_workflow() or
-                     run_workflow_stream().
-
-  Streaming:         run_workflow_stream() yields WorkflowEvent at each stage.
-
-  Backward compat:   run_workflow() unchanged. checkpoint_id is optional.
 
 PHI NOTE: session IDs and proposal counts are logged. No PHI in logs.
 Checkpoint files follow the same access controls as FHIR_MCP_DB.
@@ -137,7 +116,7 @@ class WorkflowEvent:
         data: dict[str, Any] | None = None,
     ) -> None:
         self.stage = stage
-        self.status = status  # starting | complete | skipped | error
+        self.status = status
         self.data = data or {}
         self.timestamp_ms = round(time.monotonic() * 1000)
 
@@ -210,7 +189,7 @@ class ClinicalOrchestrator:
             result = await orch.run_workflow(patient_id="pat-001")
             print(result.to_dict())
 
-    Usage (resume interrupted workflow)::
+    Usage (resume)::
 
         result = await orch.run_workflow(
             patient_id="pat-001",
@@ -234,7 +213,7 @@ class ClinicalOrchestrator:
         self._gate_hook = WriteGateHook()
 
     # ------------------------------------------------------------------
-    # Public API: blocking
+    # Public API
     # ------------------------------------------------------------------
 
     async def run_workflow(
@@ -244,11 +223,6 @@ class ClinicalOrchestrator:
         document_source: str | None = None,
         checkpoint_id: str | None = None,
     ) -> WorkflowResult:
-        """Run the full dynamic pipeline for one patient.
-
-        Pass checkpoint_id to resume an interrupted workflow from the
-        last completed stage.
-        """
         result: WorkflowResult | None = None
         async for event in self.run_workflow_stream(
             patient_id=patient_id,
@@ -262,10 +236,6 @@ class ClinicalOrchestrator:
             raise RuntimeError("Workflow did not complete successfully")
         return result
 
-    # ------------------------------------------------------------------
-    # Public API: streaming
-    # ------------------------------------------------------------------
-
     async def run_workflow_stream(
         self,
         patient_id: str,
@@ -273,25 +243,13 @@ class ClinicalOrchestrator:
         document_source: str | None = None,
         checkpoint_id: str | None = None,
     ) -> AsyncGenerator[WorkflowEvent, None]:
-        """Streaming dynamic pipeline. Yields WorkflowEvent at each stage.
-
-        Stages emitted:
-          plan → intake → evidence → reasoning → refuter → critic
-          → compliance → complete
-
-        Skipped stages emit status=skipped (not starting/complete).
-        Resumed stages that already have checkpoint output are skipped.
-        """
         start = time.monotonic()
         metrics: dict[str, Any] = {}
 
-        # Load or create checkpoint
         ckpt = self._init_checkpoint(patient_id, checkpoint_id)
         completed = ckpt.completed_stages()
 
-        # ------------------------------------------------------------------
         # Stage 0: Plan
-        # ------------------------------------------------------------------
         if "plan" in completed:
             plan = WorkflowPlan(json.loads(completed["plan"]))
             yield WorkflowEvent("plan", "skipped", {"task_type": plan.task_type, "resumed": True})
@@ -302,19 +260,12 @@ class ClinicalOrchestrator:
             metrics["plan_ms"] = round((time.monotonic() - t0) * 1000, 1)
             ckpt.save_plan(plan.to_dict())
             ckpt.save_stage("plan", json.dumps(plan.to_dict()))
-            yield WorkflowEvent(
-                "plan", "complete",
-                {
-                    "task_type": plan.task_type,
-                    "fast_path": plan.fast_path,
-                    "rationale": plan.plan_rationale,
-                    "elapsed_ms": metrics["plan_ms"],
-                },
-            )
+            yield WorkflowEvent("plan", "complete", {
+                "task_type": plan.task_type, "fast_path": plan.fast_path,
+                "rationale": plan.plan_rationale, "elapsed_ms": metrics["plan_ms"],
+            })
 
-        # ------------------------------------------------------------------
         # Stage 1: Intake
-        # ------------------------------------------------------------------
         if "intake" in completed:
             patient_context = completed["intake"]
             yield WorkflowEvent("intake", "skipped", {"resumed": True})
@@ -326,9 +277,7 @@ class ClinicalOrchestrator:
             ckpt.save_stage("intake", patient_context)
             yield WorkflowEvent("intake", "complete", {"elapsed_ms": metrics.get("intake_ms")})
 
-        # ------------------------------------------------------------------
-        # Stage 2: Evidence (parallel RAG + trials, plan-gated)
-        # ------------------------------------------------------------------
+        # Stage 2: Evidence (parallel)
         rag_context = completed.get("evidence_rag", "{}")
         trials_context = completed.get("evidence_trials", "{}")
 
@@ -337,14 +286,15 @@ class ClinicalOrchestrator:
         elif plan.fast_path:
             yield WorkflowEvent("evidence", "skipped", {"reason": "fast_path"})
         else:
-            yield WorkflowEvent("evidence", "starting", {"parallel": True, "rag": plan.run_rag, "trials": plan.run_trials})
+            yield WorkflowEvent("evidence", "starting", {
+                "parallel": True, "rag": plan.run_rag, "trials": plan.run_trials
+            })
             t0 = time.monotonic()
             tasks = []
             if plan.run_rag and "evidence_rag" not in completed:
                 tasks.append(("rag", self._run_rag(patient_context)))
             if plan.run_trials and "evidence_trials" not in completed:
                 tasks.append(("trials", self._run_trials(patient_context)))
-
             if tasks:
                 names, coros = zip(*tasks)
                 results = await asyncio.gather(*coros)
@@ -355,20 +305,14 @@ class ClinicalOrchestrator:
                     else:
                         trials_context = output
                         ckpt.save_stage("evidence_trials", trials_context)
-
             metrics["evidence_parallel_ms"] = round((time.monotonic() - t0) * 1000, 1)
-            yield WorkflowEvent(
-                "evidence", "complete",
-                {
-                    "elapsed_ms": metrics["evidence_parallel_ms"],
-                    "guideline_count": len(self._extract_guidelines(rag_context)),
-                    "trial_count": len(self._extract_trials(trials_context)),
-                },
-            )
+            yield WorkflowEvent("evidence", "complete", {
+                "elapsed_ms": metrics["evidence_parallel_ms"],
+                "guideline_count": len(self._extract_guidelines(rag_context)),
+                "trial_count": len(self._extract_trials(trials_context)),
+            })
 
-        # ------------------------------------------------------------------
-        # Stage 3: Reasoning (plan-gated, budget from plan)
-        # ------------------------------------------------------------------
+        # Stage 3: Reasoning
         if "reasoning" in completed:
             reasoning_context = completed["reasoning"]
             yield WorkflowEvent("reasoning", "skipped", {"resumed": True})
@@ -377,26 +321,22 @@ class ClinicalOrchestrator:
             yield WorkflowEvent("reasoning", "skipped", {"reason": "not required by plan"})
         else:
             reasoning_subagent = self._reasoning_subagent_for_plan(plan)
-            yield WorkflowEvent(
-                "reasoning", "starting",
-                {"extended_thinking": plan.extended_thinking, "budget_tokens": plan.reasoning_budget},
-            )
+            yield WorkflowEvent("reasoning", "starting", {
+                "extended_thinking": plan.extended_thinking,
+                "budget_tokens": plan.reasoning_budget,
+            })
             t0 = time.monotonic()
             reasoning_context = await self._run_reasoning(
-                patient_context, rag_context, trials_context,
-                subagent=reasoning_subagent,
+                patient_context, rag_context, trials_context, subagent=reasoning_subagent,
             )
             metrics["reasoning_ms"] = round((time.monotonic() - t0) * 1000, 1)
             ckpt.save_stage("reasoning", reasoning_context)
-            proposed = self._extract_proposed_observations(reasoning_context)
-            yield WorkflowEvent(
-                "reasoning", "complete",
-                {"elapsed_ms": metrics["reasoning_ms"], "proposal_count": len(proposed)},
-            )
+            yield WorkflowEvent("reasoning", "complete", {
+                "elapsed_ms": metrics["reasoning_ms"],
+                "proposal_count": len(self._extract_proposed_observations(reasoning_context)),
+            })
 
-        # ------------------------------------------------------------------
-        # Stage 3.5: Refuter (adversarial, sequential, plan-gated)
-        # ------------------------------------------------------------------
+        # Stage 3.5: Refuter
         if "refuter" in completed:
             refuter_context = completed["refuter"]
             yield WorkflowEvent("refuter", "skipped", {"resumed": True})
@@ -412,18 +352,13 @@ class ClinicalOrchestrator:
             metrics["refuter_ms"] = round((time.monotonic() - t0) * 1000, 1)
             ckpt.save_stage("refuter", refuter_context)
             refuter_data = self._parse_json(refuter_context)
-            yield WorkflowEvent(
-                "refuter", "complete",
-                {
-                    "elapsed_ms": metrics["refuter_ms"],
-                    "verdict": refuter_data.get("refuter_verdict", "unknown"),
-                    "attack_count": len(refuter_data.get("attacks", [])),
-                },
-            )
+            yield WorkflowEvent("refuter", "complete", {
+                "elapsed_ms": metrics["refuter_ms"],
+                "verdict": refuter_data.get("refuter_verdict", "unknown"),
+                "attack_count": len(refuter_data.get("attacks", [])),
+            })
 
-        # ------------------------------------------------------------------
-        # Stage 4: Critic (resolves Reasoning vs Refuter)
-        # ------------------------------------------------------------------
+        # Stage 4: Critic
         if "critic" in completed:
             critique_context = completed["critic"]
             yield WorkflowEvent("critic", "skipped", {"resumed": True})
@@ -437,17 +372,12 @@ class ClinicalOrchestrator:
             metrics["critic_ms"] = round((time.monotonic() - t0) * 1000, 1)
             ckpt.save_stage("critic", critique_context)
             critique_data = self._parse_json(critique_context)
-            yield WorkflowEvent(
-                "critic", "complete",
-                {
-                    "elapsed_ms": metrics["critic_ms"],
-                    "verdict": critique_data.get("overall_verdict", "unknown"),
-                },
-            )
+            yield WorkflowEvent("critic", "complete", {
+                "elapsed_ms": metrics["critic_ms"],
+                "verdict": critique_data.get("overall_verdict", "unknown"),
+            })
 
-        # ------------------------------------------------------------------
         # Stage 5: Compliance
-        # ------------------------------------------------------------------
         if "compliance" in completed:
             compliance_context = completed["compliance"]
             yield WorkflowEvent("compliance", "skipped", {"resumed": True})
@@ -459,15 +389,12 @@ class ClinicalOrchestrator:
             )
             metrics["compliance_ms"] = round((time.monotonic() - t0) * 1000, 1)
             ckpt.save_stage("compliance", compliance_context)
-            proposals = self._extract_staged_proposals(compliance_context)
-            yield WorkflowEvent(
-                "compliance", "complete",
-                {"elapsed_ms": metrics["compliance_ms"], "staged_count": len(proposals)},
-            )
+            yield WorkflowEvent("compliance", "complete", {
+                "elapsed_ms": metrics["compliance_ms"],
+                "staged_count": len(self._extract_staged_proposals(compliance_context)),
+            })
 
-        # ------------------------------------------------------------------
         # Complete
-        # ------------------------------------------------------------------
         metrics["workflow_total_ms"] = round((time.monotonic() - start) * 1000, 1)
         metrics.update(self._audit_hook.metrics())
 
@@ -481,7 +408,6 @@ class ClinicalOrchestrator:
             critique.get("overall_verdict"), metrics["workflow_total_ms"],
         )
 
-        # Delete checkpoint on success
         ckpt.delete()
 
         result = WorkflowResult(
@@ -499,7 +425,7 @@ class ClinicalOrchestrator:
         yield WorkflowEvent("complete", "complete", {"result": result})
 
     # ------------------------------------------------------------------
-    # Checkpoint helpers
+    # Checkpoint
     # ------------------------------------------------------------------
 
     def _init_checkpoint(
@@ -508,12 +434,10 @@ class ClinicalOrchestrator:
         if checkpoint_id:
             try:
                 store = CheckpointStore.load(checkpoint_id)
-                _logger.info("Resuming workflow from checkpoint=%s", checkpoint_id)
+                _logger.info("Resuming from checkpoint=%s", checkpoint_id)
                 return store
             except FileNotFoundError:
-                _logger.warning(
-                    "Checkpoint %s not found; starting fresh", checkpoint_id
-                )
+                _logger.warning("Checkpoint %s not found; starting fresh", checkpoint_id)
         return CheckpointStore(patient_id=patient_id, actor=self._actor)
 
     # ------------------------------------------------------------------
@@ -540,14 +464,11 @@ class ClinicalOrchestrator:
                 raise ValueError("Planner returned empty JSON")
             return WorkflowPlan(plan_data)
         except Exception as exc:
-            _logger.warning("Planner failed (%s); using default full-workup plan", exc)
+            _logger.warning("Planner failed (%s); using default plan", exc)
             return WorkflowPlan.default()
 
     async def _run_intake(
-        self,
-        patient_id: str,
-        session_id: str | None,
-        document_source: str | None,
+        self, patient_id: str, session_id: str | None, document_source: str | None,
     ) -> str:
         prompt = f"Fetch all available data for patient {patient_id}."
         if document_source:
@@ -557,9 +478,7 @@ class ClinicalOrchestrator:
             )
         prompt += " Return demographics and all observations as structured JSON."
         return await self._query_subagent(
-            subagent=INTAKE_SUBAGENT,
-            prompt=prompt,
-            session_id=session_id,
+            subagent=INTAKE_SUBAGENT, prompt=prompt, session_id=session_id,
         )
 
     async def _run_rag(self, patient_context: str) -> str:
@@ -598,48 +517,34 @@ class ClinicalOrchestrator:
         )
 
     async def _run_refuter(
-        self,
-        reasoning_context: str,
-        rag_context: str,
-        patient_context: str,
+        self, reasoning_context: str, rag_context: str, patient_context: str,
     ) -> str:
         return await self._query_subagent(
             subagent=REFUTER_SUBAGENT,
             prompt=(
                 "Attack the following clinical proposals. "
                 "Find every reason they might be wrong.\n\n"
-                "<proposals_from_reasoning>\n"
-                f"{reasoning_context}\n"
-                "</proposals_from_reasoning>\n\n"
-                "<raw_evidence_for_your_attacks>\n"
-                f"{rag_context}\n"
-                "</raw_evidence_for_your_attacks>\n\n"
-                "<patient_context_for_confounders>\n"
-                f"{patient_context}\n"
-                "</patient_context_for_confounders>"
+                f"<proposals_from_reasoning>\n{reasoning_context}\n</proposals_from_reasoning>\n\n"
+                f"<raw_evidence>\n{rag_context}\n</raw_evidence>\n\n"
+                f"<patient_context>\n{patient_context}\n</patient_context>"
             ),
         )
 
     async def _run_critic(
-        self,
-        reasoning_context: str,
-        refuter_context: str,
+        self, reasoning_context: str, refuter_context: str,
     ) -> str:
         return await self._query_subagent(
             subagent=CRITIC_SUBAGENT,
             prompt=(
-                "Resolve the following dialectic. Weigh the clinical reasoning "
-                "against the adversarial attacks and produce a synthesis verdict.\n\n"
+                "Resolve the dialectic. Weigh the clinical reasoning against "
+                "the adversarial attacks and produce a synthesis verdict.\n\n"
                 f"<reasoning_thesis>\n{reasoning_context}\n</reasoning_thesis>\n\n"
                 f"<refuter_antithesis>\n{refuter_context}\n</refuter_antithesis>"
             ),
         )
 
     async def _run_compliance(
-        self,
-        reasoning_context: str,
-        refuter_context: str,
-        critique_context: str,
+        self, reasoning_context: str, refuter_context: str, critique_context: str,
     ) -> str:
         return await self._query_subagent(
             subagent=COMPLIANCE_SUBAGENT,
@@ -647,7 +552,7 @@ class ClinicalOrchestrator:
                 "Stage the proposals that survived critic review for human approval.\n\n"
                 "Rules:\n"
                 "- Only stage proposals where Critic recommendation is approve or revise.\n"
-                "- Include Critic verdict AND Refuter attack summary in every reason field.\n"
+                "- Include Critic verdict AND Refuter summary in every reason field.\n"
                 "- Do NOT stage proposals Critic recommended reject.\n\n"
                 f"<proposals>\n{reasoning_context}\n</proposals>\n\n"
                 f"<refuter_attacks>\n{refuter_context}\n</refuter_attacks>\n\n"
@@ -661,7 +566,6 @@ class ClinicalOrchestrator:
 
     @staticmethod
     def _reasoning_subagent_for_plan(plan: WorkflowPlan) -> SubagentConfig:
-        """Return a Reasoning subagent config with budget from the plan."""
         from .subagents import SubagentConfig, REASONING_SYSTEM_PROMPT
         thinking = (
             {"type": "enabled", "budget_tokens": plan.reasoning_budget}
@@ -759,6 +663,42 @@ class ClinicalOrchestrator:
         self, compliance_context: str
     ) -> list[dict[str, Any]]:
         return self._parse_json(compliance_context).get("staged", [])
+
+    # ------------------------------------------------------------------
+    # Backward-compatible static helpers (used by test suite)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _needs_extended_thinking(patient_context: str) -> bool:
+        """Heuristic: route to extended thinking if context mentions flag thresholds.
+
+        Preserved for backward compatibility with test_orchestrator.py.
+        In the 7-agent architecture the Planner decides this based on
+        task description; this method is no longer called by the orchestrator.
+        """
+        keywords = ["flag", "above", "critical", "urgent", "alert", ">"]
+        ctx_lower = patient_context.lower()
+        return any(kw in ctx_lower for kw in keywords)
+
+    @staticmethod
+    def _parse_proposals(response: str) -> list[dict[str, Any]]:
+        """Extract proposals list from a {\"proposals\": [...]} response.
+
+        Preserved for backward compatibility with test_orchestrator.py.
+        The 7-agent architecture uses _extract_proposed_observations() for
+        Reasoning output and _extract_staged_proposals() for Compliance output.
+        """
+        try:
+            data = json.loads(response)
+            return data.get("proposals", [])
+        except (json.JSONDecodeError, AttributeError):
+            m = re.search(r"\{.*?\"proposals\".*?\}", response, re.DOTALL)
+            if m:
+                try:
+                    return json.loads(m.group(0)).get("proposals", [])
+                except json.JSONDecodeError:
+                    pass
+        return []
 
     # ------------------------------------------------------------------
     # Stubs for test/CI
