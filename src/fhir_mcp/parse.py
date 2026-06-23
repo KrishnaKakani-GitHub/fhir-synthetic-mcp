@@ -21,6 +21,9 @@ API: NVIDIA NIM (OpenAI-compatible)
   Model: nvidia/nemotron-parse
   Auth:  NVIDIA_API_KEY environment variable
 
+NIM accepts JPEG, PNG, BMP, TIFF, WEBP — NOT raw PDFs.
+PDFs are rendered to per-page PNG images via pypdfium2 before sending.
+
 For PHI compliance, deploy NIM self-hosted on-premises so no document
 content leaves your infrastructure. The cloud NIM endpoint is suitable
 for synthetic or de-identified documents only.
@@ -31,6 +34,7 @@ self-hosted NIM endpoint (NEMOTRON_PARSE_BASE_URL env var).
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import os
@@ -47,7 +51,8 @@ _BASE_URL = os.environ.get(
     "https://integrate.api.nvidia.com/v1",
 )
 _MODEL = "nvidia/nemotron-parse"
-_TIMEOUT = 60  # seconds; large documents may take time
+_TIMEOUT = 60  # seconds
+_MAX_PAGES = 10  # cap to avoid token limits on large documents
 
 _PARSE_SYSTEM_PROMPT = (
     "You are a clinical document parser. Extract and structure all content "
@@ -68,13 +73,14 @@ class ParseResult:
         output_tokens: int = 0,
         model: str = _MODEL,
         parse_method: str = "nemotron_parse",
+        page_count: int = 0,
     ) -> None:
         self.structured_text = structured_text
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.model = model
         self.parse_method = parse_method
-        # Rough word count for logging (no PHI content)
+        self.page_count = page_count
         self.output_word_count = len(structured_text.split())
 
     def to_dict(self) -> dict[str, Any]:
@@ -84,8 +90,66 @@ class ParseResult:
             "output_tokens": self.output_tokens,
             "model": self.model,
             "parse_method": self.parse_method,
+            "page_count": self.page_count,
             "output_word_count": self.output_word_count,
         }
+
+
+# ---------------------------------------------------------------------------
+# PDF helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_pdf(source: str | Path | bytes) -> bool:
+    """Detect PDF by URL extension, file extension, or magic bytes."""
+    if isinstance(source, bytes):
+        return source[:4] == b"%PDF"
+    return str(source).lower().endswith(".pdf")
+
+
+def _download_url(url: str) -> bytes:
+    """Fetch a remote URL to bytes."""
+    req = urllib.request.Request(url, headers={"User-Agent": "fhir-mcp/1.0"})
+    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+        return resp.read()
+
+
+def _pdf_to_page_images(pdf_bytes: bytes) -> list[str]:
+    """Render PDF pages to base64 PNG strings via pypdfium2.
+
+    Returns one base64 PNG string per page, capped at _MAX_PAGES.
+    pypdfium2 is a pure-Python wheel with bundled libpdfium — no
+    system dependencies required.
+
+    Install: pip install pypdfium2
+    """
+    try:
+        import pypdfium2 as pdfium  # type: ignore
+    except ImportError as e:
+        raise ImportError(
+            "pypdfium2 is required to parse PDF files. "
+            "Install it: pip install pypdfium2"
+        ) from e
+
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    page_images: list[str] = []
+    n_pages = min(len(pdf), _MAX_PAGES)
+
+    for i in range(n_pages):
+        page = pdf[i]
+        bitmap = page.render(scale=2)  # 2x scale improves OCR quality
+        pil_image = bitmap.to_pil()
+        buf = io.BytesIO()
+        pil_image.save(buf, format="PNG")
+        page_images.append(base64.b64encode(buf.getvalue()).decode())
+
+    _logger.info("Rendered %d/%d PDF pages to PNG", n_pages, len(pdf))
+    return page_images
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 
 def parse_document(
@@ -98,16 +162,15 @@ def parse_document(
         source: One of:
           - str/Path: local file path (PDF, PNG, JPG, TIFF)
           - bytes:    raw document bytes
-          - str starting with 'http': public URL (non-PHI only)
+          - str starting with 'http': public URL (PDF or image)
         document_type: Hint for the parser. One of:
           'clinical', 'prior_auth', 'eob', 'treatment_plan', 'lab_report'
 
     Returns:
         ParseResult with structured_text (markdown) ready for NLP extraction.
 
-    Raises:
-        ValueError: If source type is unrecognised.
-        RuntimeError: If the NIM API returns an error.
+    PDFs are converted to per-page PNG images before sending to NIM,
+    since the NIM API accepts JPEG/PNG/BMP/TIFF/WEBP but not raw PDFs.
 
     PHI NOTE: Document content is sent to NVIDIA NIM. Use a self-hosted
     NIM endpoint (NEMOTRON_PARSE_BASE_URL) for documents containing PHI.
@@ -119,51 +182,95 @@ def parse_document(
         )
         return _fallback_parse(source)
 
-    # Prepare document content
-    if isinstance(source, (str, Path)) and not str(source).startswith("http"):
+    # --- Resolve source to bytes or image_url list -------------------------
+    content_items: list[dict[str, Any]] = []
+    page_count = 0
+
+    if isinstance(source, str) and source.startswith("http"):
+        if _is_pdf(source):
+            # Download PDF, render to PNG pages
+            _logger.info("Downloading PDF from URL for page rendering")
+            pdf_bytes = _download_url(source)
+            page_b64s = _pdf_to_page_images(pdf_bytes)
+            page_count = len(page_b64s)
+            content_items = [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                }
+                for b64 in page_b64s
+            ]
+        else:
+            # Direct image URL (PNG, JPEG, etc.)
+            page_count = 1
+            content_items = [
+                {"type": "image_url", "image_url": {"url": source}}
+            ]
+
+    elif isinstance(source, (str, Path)) and not str(source).startswith("http"):
         path = Path(source)
         if not path.exists():
             raise ValueError(f"File not found: {path}")
         doc_bytes = path.read_bytes()
-        media_type = _infer_media_type(path)
-        doc_b64 = base64.b64encode(doc_bytes).decode()
-        content_item: dict[str, Any] = {
-            "type": "image_url",
-            "image_url": {"url": f"data:{media_type};base64,{doc_b64}"},
-        }
+        if _is_pdf(source) or _is_pdf(doc_bytes):
+            page_b64s = _pdf_to_page_images(doc_bytes)
+            page_count = len(page_b64s)
+            content_items = [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                }
+                for b64 in page_b64s
+            ]
+        else:
+            # Local image file
+            media_type = _infer_media_type(path)
+            doc_b64 = base64.b64encode(doc_bytes).decode()
+            page_count = 1
+            content_items = [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{media_type};base64,{doc_b64}"},
+                }
+            ]
+
     elif isinstance(source, bytes):
-        doc_b64 = base64.b64encode(source).decode()
-        content_item = {
-            "type": "image_url",
-            "image_url": {"url": f"data:application/pdf;base64,{doc_b64}"},
-        }
-    elif isinstance(source, str) and source.startswith("http"):
-        content_item = {
-            "type": "image_url",
-            "image_url": {"url": source},
-        }
+        if _is_pdf(source):
+            page_b64s = _pdf_to_page_images(source)
+            page_count = len(page_b64s)
+            content_items = [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                }
+                for b64 in page_b64s
+            ]
+        else:
+            doc_b64 = base64.b64encode(source).decode()
+            page_count = 1
+            content_items = [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{doc_b64}"},
+                }
+            ]
     else:
         raise ValueError(f"Unsupported source type: {type(source)}")
 
-    system_prompt = (
-        f"{_PARSE_SYSTEM_PROMPT} "
-        f"Document type: {document_type}."
+    if not content_items:
+        return _fallback_parse(source)
+
+    # --- Build NIM request -------------------------------------------------
+    system_prompt = f"{_PARSE_SYSTEM_PROMPT} Document type: {document_type}."
+    content_items.append(
+        {"type": "text", "text": "Parse this document and return structured markdown."}
     )
 
     payload = json.dumps({
         "model": _MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    content_item,
-                    {
-                        "type": "text",
-                        "text": "Parse this document and return structured markdown.",
-                    },
-                ],
-            },
+            {"role": "user", "content": content_items},
         ],
         "max_tokens": 4096,
         "temperature": 0,
@@ -198,10 +305,10 @@ def parse_document(
     usage = data.get("usage", {})
 
     _logger.info(
-        "Nemotron Parse complete: output_words=%d input_tokens=%d output_tokens=%d",
+        "Nemotron Parse complete: pages=%d output_words=%d input_tokens=%d",
+        page_count,
         len(structured_text.split()),
         usage.get("prompt_tokens", 0),
-        usage.get("completion_tokens", 0),
     )
 
     return ParseResult(
@@ -210,19 +317,21 @@ def parse_document(
         output_tokens=usage.get("completion_tokens", 0),
         model=_MODEL,
         parse_method="nemotron_parse_nim",
+        page_count=page_count,
     )
 
 
 def _infer_media_type(path: Path) -> str:
     suffix = path.suffix.lower()
     return {
-        ".pdf": "application/pdf",
         ".png": "image/png",
         ".jpg": "image/jpeg",
         ".jpeg": "image/jpeg",
         ".tiff": "image/tiff",
         ".tif": "image/tiff",
-    }.get(suffix, "application/octet-stream")
+        ".bmp": "image/bmp",
+        ".webp": "image/webp",
+    }.get(suffix, "image/png")
 
 
 def _fallback_parse(source: str | Path | bytes) -> ParseResult:
