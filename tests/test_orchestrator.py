@@ -137,9 +137,7 @@ def test_write_gate_hook_passes_read_tools() -> None:
 def test_orchestrator_stub_workflow() -> None:
     """Run the full workflow without the Agent SDK (stub mode)."""
     orch = ClinicalOrchestrator(actor="test:orchestrator")
-    result = asyncio.get_event_loop().run_until_complete(
-        orch.run_workflow(patient_id="pat-001")
-    )
+    result = asyncio.run(orch.run_workflow(patient_id="pat-001"))
     assert isinstance(result, WorkflowResult)
     assert result.patient_id == "pat-001"
     assert isinstance(result.proposals, list)
@@ -149,9 +147,7 @@ def test_orchestrator_stub_workflow() -> None:
 
 def test_orchestrator_workflow_result_serialises() -> None:
     orch = ClinicalOrchestrator()
-    result = asyncio.get_event_loop().run_until_complete(
-        orch.run_workflow(patient_id="pat-001")
-    )
+    result = asyncio.run(orch.run_workflow(patient_id="pat-001"))
     d = result.to_dict()
     assert d["patient_id"] == "pat-001"
     # Should be JSON-serialisable
