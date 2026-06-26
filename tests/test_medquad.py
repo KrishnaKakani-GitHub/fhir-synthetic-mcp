@@ -1,151 +1,176 @@
-"""Tests for the MedQuAD loader (datasets layer).
+"""Tests for src/fhir_mcp/medquad.py.
 
-Covers:
-  - CSV parsing with gold annotations
-  - XML parsing (MedQuAD document shape)
-  - filters: only_gold_cui, only_answered, limit
-  - MedQuADItem properties: has_gold_cui, is_answered, is_rare_disease
-  - graceful behaviour on a missing data dir (no raise)
+All tests run without the full MedQuAD corpus — fixtures are minimal
+in-memory CSV and XML strings that exercise both parser paths.
 """
 from __future__ import annotations
 
+import textwrap
 from pathlib import Path
 
 import pytest
 
-from fhir_mcp.medquad import MedQuADItem, MedQuADLoader, get_loader
+from fhir_mcp.medquad import (
+    LoadResult,
+    MedQuADItem,
+    MedQuADLoader,
+    get_loader,
+)
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Fixtures — written to tmp_path so tests are hermetic
 # ---------------------------------------------------------------------------
 
-_CSV = """qid,source,question_type,question,answer,focus,focus_category,cui,semantic_type,synonyms
-0000001-1,GARD,information,What is (are) Adult-onset Still's disease ?,A rare inflammatory condition.,Adult-onset Still's disease,Disease,C0085253,Disease or Syndrome,AOSD|Still disease adult
-0000002-1,MedlinePlus,treatment,What are the treatments for hypertension ?,,Hypertension,Disease,C0020538,Disease or Syndrome,High blood pressure
-0000003-1,NIDDK,causes,What causes diabetes ?,Multiple factors contribute.,Diabetes,Disease,,Disease or Syndrome,
-"""
+CSV_CONTENT = textwrap.dedent("""\
+    qtype,Question,Answer,source,Focus,CUI,SemanticType,url
+    information,What is Type 2 Diabetes?,"Type 2 diabetes is a chronic condition.",niddk,Type 2 Diabetes,C0011860,Disease or Syndrome,https://niddk.nih.gov/diabetes
+    treatment,How is PNH treated?,"Treatment includes eculizumab.",GARD,Paroxysmal nocturnal hemoglobinuria,C0028344,Disease or Syndrome,https://rarediseases.info.nih.gov/diseases
+    symptoms,What are the symptoms of diabetes?,,niddk,Type 2 Diabetes,C0011860,Disease or Syndrome,
+    information,What causes anemia?,,medlineplus,,,,
+""")
 
-_XML = """<Document id="0000010" source="GARD" url="http://example">
-  <Focus>Fabry disease</Focus>
-  <FocusAnnotations>
-    <UMLS>
-      <CUIs><CUI>C0002986</CUI></CUIs>
-      <SemanticTypes><SemanticType>Disease or Syndrome</SemanticType></SemanticTypes>
-      <Synonyms>
-        <Synonym>Anderson-Fabry disease</Synonym>
-        <Synonym>Alpha-galactosidase A deficiency</Synonym>
-      </Synonyms>
-    </UMLS>
-  </FocusAnnotations>
-  <QAPairs>
-    <QAPair pid="1">
-      <Question qid="0000010-1" qtype="information">What is (are) Fabry disease ?</Question>
-      <Answer>Fabry disease is a rare genetic disorder.</Answer>
-    </QAPair>
-  </QAPairs>
-</Document>
-"""
+XML_CONTENT = textwrap.dedent("""\
+    <?xml version="1.0" encoding="UTF-8"?>
+    <Dataset>
+      <Source>GARD</Source>
+      <URL>https://rarediseases.info.nih.gov/diseases/7537</URL>
+      <Focus>Gaucher disease</Focus>
+      <FocusAnnotations>
+        <UMLS>
+          <CUIs><CUI>C0017205</CUI></CUIs>
+          <SemanticTypeList>
+            <SemanticType>Disease or Syndrome</SemanticType>
+          </SemanticTypeList>
+        </UMLS>
+      </FocusAnnotations>
+      <QAPairs>
+        <QAPair pid="1">
+          <Question qtype="information">What is Gaucher disease?</Question>
+          <Answer>Gaucher disease is a rare genetic disorder.</Answer>
+        </QAPair>
+        <QAPair pid="2">
+          <Question qtype="treatment">How is Gaucher disease treated?</Question>
+          <Answer>Treatment includes enzyme replacement therapy.</Answer>
+        </QAPair>
+        <QAPair pid="3">
+          <Question qtype="frequency">How common is Gaucher disease?</Question>
+          <Answer></Answer>
+        </QAPair>
+      </QAPairs>
+    </Dataset>
+""")
 
 
 @pytest.fixture()
-def csv_dir(tmp_path: Path) -> Path:
-    d = tmp_path / "medquad_csv"
-    d.mkdir()
-    (d / "sample.csv").write_text(_CSV, encoding="utf-8")
-    return d
+def csv_corpus(tmp_path: Path) -> Path:
+    """Write CSV fixture and return the corpus dir."""
+    corpus_dir = tmp_path / "medquad"
+    corpus_dir.mkdir()
+    (corpus_dir / "test_source.csv").write_text(CSV_CONTENT, encoding="utf-8")
+    return corpus_dir
 
 
 @pytest.fixture()
-def xml_dir(tmp_path: Path) -> Path:
-    d = tmp_path / "medquad_xml"
-    (d / "GARD").mkdir(parents=True)
-    (d / "GARD" / "0000010.xml").write_text(_XML, encoding="utf-8")
-    return d
+def xml_corpus(tmp_path: Path) -> Path:
+    """Write XML fixture and return the corpus dir."""
+    corpus_dir = tmp_path / "medquad"
+    corpus_dir.mkdir()
+    (corpus_dir / "GARD_gaucher.xml").write_text(XML_CONTENT, encoding="utf-8")
+    return corpus_dir
 
 
 # ---------------------------------------------------------------------------
-# CSV
+# CSV loader tests
 # ---------------------------------------------------------------------------
 
 
-def test_csv_loads_all_items(csv_dir: Path) -> None:
-    items = MedQuADLoader(csv_dir).load()
-    assert len(items) == 3
-    first = items[0]
-    assert first.qid == "0000001-1"
-    assert first.focus == "Adult-onset Still's disease"
-    assert first.cui == "C0085253"
-    assert first.synonyms == ["AOSD", "Still disease adult"]
+def test_csv_loads_all_questions(csv_corpus: Path) -> None:
+    """All four rows in the CSV fixture are loaded (even unanswered ones)."""
+    result = MedQuADLoader(corpus_dir=csv_corpus).load()
+    assert result.total == 4
+    assert bool(result)  # LoadResult.__bool__
 
 
-def test_csv_only_gold_cui_filters_missing_cui(csv_dir: Path) -> None:
-    items = MedQuADLoader(csv_dir).load(only_gold_cui=True)
-    # row 3 (diabetes) has an empty CUI and must be dropped
-    assert {i.focus for i in items} == {
-        "Adult-onset Still's disease",
-        "Hypertension",
-    }
+def test_csv_answered_count(csv_corpus: Path) -> None:
+    """Only rows with non-empty answers are counted as answered."""
+    result = MedQuADLoader(corpus_dir=csv_corpus).load()
+    # Rows 0 and 1 have answers; rows 2 and 3 are empty
+    assert result.answered == 2
 
 
-def test_csv_only_answered_filters_empty_answers(csv_dir: Path) -> None:
-    items = MedQuADLoader(csv_dir).load(only_answered=True)
-    # row 2 (hypertension) has an empty answer and must be dropped
-    foci = {i.focus for i in items}
-    assert "Hypertension" not in foci
-    assert "Adult-onset Still's disease" in foci
+def test_csv_rare_disease_flag(csv_corpus: Path) -> None:
+    """GARD-sourced rows are identified as rare-disease items."""
+    result = MedQuADLoader(corpus_dir=csv_corpus).load()
+    rare = [i for i in result.items if i.is_rare_disease]
+    assert len(rare) == 1
+    assert rare[0].focus == "Paroxysmal nocturnal hemoglobinuria"
 
 
-def test_limit_caps_results(csv_dir: Path) -> None:
-    items = MedQuADLoader(csv_dir).load(limit=2)
-    assert len(items) == 2
-
-
-# ---------------------------------------------------------------------------
-# XML
-# ---------------------------------------------------------------------------
-
-
-def test_xml_parses_focus_and_cui(xml_dir: Path) -> None:
-    items = MedQuADLoader(xml_dir).load()
-    assert len(items) == 1
-    item = items[0]
-    assert item.qid == "0000010-1"
-    assert item.focus == "Fabry disease"
-    assert item.cui == "C0002986"
-    assert item.question_type == "information"
-    assert "Anderson-Fabry disease" in item.synonyms
-    assert item.is_answered
+def test_csv_gold_cui_flag(csv_corpus: Path) -> None:
+    """Items with a non-empty CUI column report has_gold_cui=True."""
+    result = MedQuADLoader(corpus_dir=csv_corpus).load()
+    with_cui = [i for i in result.items if i.has_gold_cui]
+    without_cui = [i for i in result.items if not i.has_gold_cui]
+    assert len(with_cui) == 3   # rows 0,1,2 have CUI C0011860/C0028344/C0011860
+    assert len(without_cui) == 1  # row 3 (anemia) has no CUI
 
 
 # ---------------------------------------------------------------------------
-# Item properties
+# XML loader tests
 # ---------------------------------------------------------------------------
 
 
-def test_properties() -> None:
-    item = MedQuADItem(
-        qid="x-1", source="GARD", question="q?", answer="a", cui="C0001"
-    )
-    assert item.has_gold_cui
-    assert item.is_answered
-    assert item.is_rare_disease
+def test_xml_loads_qa_pairs(xml_corpus: Path) -> None:
+    """All three QAPairs in the XML fixture are loaded."""
+    result = MedQuADLoader(corpus_dir=xml_corpus).load()
+    assert result.total == 3
 
-    bare = MedQuADItem(qid="y-1", source="MedlinePlus", question="q?")
-    assert not bare.has_gold_cui
-    assert not bare.is_answered
-    assert not bare.is_rare_disease
+
+def test_xml_metadata_propagated(xml_corpus: Path) -> None:
+    """Source-level metadata (Focus, CUI, SemanticType) is applied to each item."""
+    result = MedQuADLoader(corpus_dir=xml_corpus).load()
+    for item in result.items:
+        assert item.focus == "Gaucher disease"
+        assert item.cui == "C0017205"
+        assert item.semantic_type == "Disease or Syndrome"
+        assert item.source == "GARD"
+        assert item.is_rare_disease
+
+
+def test_xml_unanswered_item(xml_corpus: Path) -> None:
+    """A QAPair with an empty Answer element is loaded but marked unanswered."""
+    result = MedQuADLoader(corpus_dir=xml_corpus).load()
+    answered = [i for i in result.items if i.is_answered]
+    unanswered = [i for i in result.items if not i.is_answered]
+    assert len(answered) == 2
+    assert len(unanswered) == 1
 
 
 # ---------------------------------------------------------------------------
-# Robustness
+# Filter and missing-corpus tests
 # ---------------------------------------------------------------------------
 
 
-def test_missing_dir_returns_empty_without_raising(tmp_path: Path) -> None:
-    items = MedQuADLoader(tmp_path / "does_not_exist").load()
-    assert items == []
+def test_filter_by_question_type(csv_corpus: Path) -> None:
+    """filter(question_type=...) returns only matching items."""
+    loader = MedQuADLoader(corpus_dir=csv_corpus)
+    info_items = loader.filter(question_type="information")
+    assert all(i.question_type == "information" for i in info_items)
+    assert len(info_items) == 2  # rows 0 and 3
 
 
-def test_get_loader_is_singleton() -> None:
-    assert get_loader() is get_loader()
+def test_missing_corpus_returns_empty(tmp_path: Path) -> None:
+    """A non-existent corpus directory returns an empty LoadResult, never raises."""
+    loader = MedQuADLoader(corpus_dir=tmp_path / "does_not_exist")
+    result = loader.load()
+    assert result.total == 0
+    assert not bool(result)  # LoadResult.__bool__ returns False
+
+
+def test_get_loader_singleton(csv_corpus: Path) -> None:
+    """get_loader() returns a MedQuADLoader; repeated calls return the same instance."""
+    loader_a = get_loader(corpus_dir=csv_corpus)
+    loader_b = get_loader()  # no override — returns cached instance
+    assert loader_a is loader_b
+    assert isinstance(loader_a, MedQuADLoader)
