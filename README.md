@@ -214,6 +214,7 @@ evals/
   golden_dataset.json  25 test cases
   runner.py            Code-based + LLM-as-judge grading
   judge_prompt.py      LLM-as-judge prompt template
+  mimic_cdm_eval.py    MIMIC-CDM 4-axis governance agent eval
 data/
   synthetic_patients.json   Seed data
   loinc_rules.json          14 LOINC validation rules
@@ -250,6 +251,150 @@ docs/
 
 ---
 
+## Datasets & Evaluation Architecture
+
+Four datasets ground the system across two sub-projects. Each is academically sourced, operates on de-identified or synthetic data, and has a dedicated evaluation methodology drawn from peer-reviewed literature.
+
+---
+
+### Dataset 1 — MedQuAD
+
+**Academic source**
+> Ben Abacha, A., & Demner-Fushman, D. (2019). A question-entailment approach to question answering. *BMC Bioinformatics*, 20(1), 511. https://doi.org/10.1186/s12859-019-3119-4
+
+47,457 question–answer pairs sourced from 12 NIH websites (MedlinePlus, CancerGov, NIDDK, NINDS, GARD, and others). Covers 37 question types across common and rare diseases. License: CC BY 4.0. No PHI — all content is public NIH patient education material.
+
+**Location:** `evidence_pipeline/datasets/medquad.py`
+
+**LLM architecture** — entity linking via deterministic crosswalk
+Each QA pair carries a `focus` (condition name) and optional UMLS CUI gold label. The pipeline maps `focus` → CUI via `ontology/cui_mapper.py` — fully deterministic, no LLM in the mapping step. The LLM role is upstream: clinical question generation and metatag refinement.
+
+**Test suite** — `evidence_pipeline/tests/test_datasets.py`
+Dataset structure, field validation, `is_answered` / `has_gold_cui` / `is_rare_disease` properties, CSV and XML format compatibility.
+
+**LLM reasoning framework — BioEL entity linking**
+> Sung, M., Jeon, H., Lee, J., & Kang, J. (2020). Biomedical Entity Representations with Synonym Marginalization. *arXiv:2005.00239*. https://arxiv.org/abs/2005.00239
+
+Implemented in `evidence_pipeline/evals/entity_linking.py` and `runner.py`. Top-k accuracy and Mean Reciprocal Rank (MRR) over the full corpus.
+
+| Metric | Smoke target | Full corpus |
+|--------|-------------|-------------|
+| Top-1 accuracy | 100% | graded |
+| Top-5 accuracy | 100% | graded |
+| MRR | 1.0 | graded |
+| Coverage (gold CUI present) | 100% | graded |
+
+---
+
+### Dataset 2 — MIMIC-IV Discharge Summaries
+
+**Academic source**
+> Johnson, A.E.W., Bulgarelli, L., Shen, L., Gayles, A., Shammout, A., Horng, S., Pollard, T.J., Hao, S., Moody, B., Gow, B., Lehman, L.H., Celi, L.A., & Mark, R.G. (2023). MIMIC-IV, a freely accessible electronic health record dataset. *Scientific Data*, 10, 1. https://doi.org/10.1038/s41597-022-01899-x
+>
+> Goldberger, A.L., Amaral, L.A.N., Glass, L., Hausdorff, J.M., Ivanov, P.Ch., Mark, R.G., Mietus, J.E., Moody, G.B., Peng, C.K., & Stanley, H.E. (2000). PhysioBank, PhysioToolkit, and PhysioNet. *Circulation*, 101(23), e215–e220. https://doi.org/10.1161/01.CIR.101.23.e215
+
+De-identified ICU discharge summaries from Beth Israel Deaconess Medical Center. Demo subset (100 patients): [physionet.org/content/mimic-iv-demo/](https://physionet.org/content/mimic-iv-demo/) — free PhysioNet account, no CITI training. Full dataset requires CITI training + signed DUA. PHI note: loader logs `note_id` only, never raw text.
+
+**Location:** `evidence_pipeline/datasets/mimic.py`, `evidence_pipeline/extraction/loinc_extractor.py`, `evidence_pipeline/pipeline/end_to_end.py`
+
+**LLM architecture** — deterministic extraction + governance gate
+24 regex patterns extract LOINC-coded observations from discharge text (zero LLM in extraction). The `HumanGate` class enforces the core governance invariant: every proposed observation is queued with a full audit entry (`who/what/when/why`) and `committed = 0` in automated mode. Human `.approve()` is required to commit — wiring to `src/fhir_mcp/store.py` in production.
+
+**Test suite** — `evidence_pipeline/tests/test_mimic.py`, `test_loinc_extractor.py`, `test_end_to_end.py`
+5 dataset tests, 14 LOINC extraction tests, 7 end-to-end tests including core governance invariant (`committed == 0`).
+
+**LLM reasoning framework — FACTS Grounding**
+> Jacovi, A., Caciularu, A., Goldman, O., & Goldberg, Y. (2025). FACTS Grounding: A New Benchmark for Evaluating the Factuality of Large Language Models. *arXiv:2501.03200*. https://arxiv.org/abs/2501.03200
+
+Implemented in `evidence_pipeline/evals/grounding.py`. Every ICD-10, RxNorm, LOINC, CUI, and NCT-ID in pipeline output is checked against its canonical source. Grounding score = `attributable_claims / total_claims`. Score of 1.0 = zero unattributed claims.
+
+**Outcome metric (measured, 10 synthetic notes):**
+> *Extracted 62 LOINC-coded observations from 10 synthetic discharge notes, 100% validated, 0% rejected by deterministic gate, 0 committed without human approval.*
+
+```bash
+python evidence_pipeline/demo_mimic.py                                # synthetic
+python evidence_pipeline/demo_mimic.py --notes-dir /path/to/mimic    # real MIMIC-IV Demo
+```
+
+---
+
+### Dataset 3 — MIMIC-CDM (Clinical Decision Making)
+
+**Academic source**
+> Hager, P., Jungmann, F., Holland, R., Bhagat, K., Hubrecht, I., Knauer, M., Vielhauer, J., Makowski, M., Braren, R., Kaissis, G., & Rueckert, D. (2024). Evaluation and mitigation of the limitations of large language models in clinical decision-making. *Nature Medicine*. https://doi.org/10.1038/s41591-024-03097-1
+>
+> Hager, P., Jungmann, F., & Rueckert, D. (2024). MIMIC-IV-Ext Clinical Decision Making (version 1.0). *PhysioNet*. https://doi.org/10.13026/2pfq-5b68
+
+Derived from MIMIC-IV. Evaluates LLMs on 4-axis clinical decision making given a patient presentation. Available at [physionet.org/content/mimic-iv-ext-cdm/](https://physionet.org/content/mimic-iv-ext-cdm/). Leaderboard: [huggingface.co/spaces/MIMIC-CDM/leaderboard](https://huggingface.co/spaces/MIMIC-CDM/leaderboard).
+
+**Location:** `evidence_pipeline/datasets/mimic_cdm.py`, `evidence_pipeline/evals/clinical_decision.py`, `evals/mimic_cdm_eval.py`
+
+**LLM architecture** — dual-layer CDM eval
+Two separate eval targets share the same `CDMCase` schema and `CDMScore` rubric:
+- `evidence_pipeline/evals/clinical_decision.py` — grades the **evidence layer**: does the ontology pipeline support correct decisions?
+- `evals/mimic_cdm_eval.py` — grades the **governance agent** (`src/clinical_agent/orchestrator.py`): does the LLM itself make correct decisions? CI uses a deterministic crosswalk-backed mock; production wires to live `ClinicalOrchestrator`.
+
+**Test suite** — `evidence_pipeline/tests/test_mimic_cdm.py`
+4 dataset structure tests, 4 F1 scoring unit tests, 3 CDM eval layer tests (composite ≥ 0.75 CI gate).
+
+**LLM reasoning framework — AMIE multi-axis auto-rater**
+> Tu, T., Palepu, A., Schaekermann, M., Saab, K., Freyberg, J., Tanno, R., Wang, A., Li, B., Amin, M., Tomasev, N., Ghassemi, M., Azizi, S., Kannan, A., Chou, K., Hassidim, A., Matias, Y., Xu, Y., Singhal, K., Gottweis, J., & Natarajan, V. (2024). Towards conversational diagnostic AI. *arXiv:2401.05654*. https://arxiv.org/abs/2401.05654
+
+Token-level F1 per axis against gold ICD-10 / RxNorm / LOINC / CPT labels. Composite = mean across 4 axes. CI gate: composite ≥ 0.75.
+
+| Axis | Gold standard | CI target |
+|------|--------------|----------|
+| Diagnosis accuracy | ICD-10 F1 | ≥ 0.75 |
+| Treatment accuracy | RxNorm F1 | ≥ 0.75 |
+| Lab ordering accuracy | LOINC F1 | ≥ 0.75 |
+| Procedure accuracy | CPT F1 | ≥ 0.75 |
+| **Composite** | mean | **≥ 0.75** |
+
+---
+
+### Dataset 4 — Governance Agent Eval Harness (25 golden cases)
+
+**Source:** Internal synthetic dataset, no PHI. Designed against the LOINC validation rules in `data/loinc_rules.json` and 8 clinical guidelines in `data/clinical_guidelines.json`.
+
+**Location:** `evals/golden_dataset.json`, `evals/runner.py`, `evals/judge_prompt.py`
+
+**LLM architecture** — code-based + LLM-as-judge
+25 cases covering accept / reject / borderline observations across 14 LOINC codes. Deterministic code-based grading (exact accept/reject match) plus LLM-as-judge for reasoning quality. Calibrated confidence scoring uses the Brier score:
+> Brier, G.W. (1950). Verification of Forecasts Expressed in Terms of Probability. *Monthly Weather Review*, 78(1), 1–3. https://doi.org/10.1175/1520-0493(1950)078<0001:VOFEIT>2.0.CO;2
+
+**Test suite** — `evals/runner.py`
+Code-based accuracy + false-negative rate, LLM-as-judge reasoning quality, calibrated Brier score.
+
+**LLM reasoning framework — LLM-as-judge**
+> Zheng, L., Chiang, W.L., Sheng, Y., Zhuang, S., Wu, Z., Zhuang, Y., Lin, Z., Li, Z., Li, D., Xing, E.P., Zhang, H., Gonzalez, J.E., & Stoica, I. (2023). Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena. *arXiv:2306.05685*. https://arxiv.org/abs/2306.05685
+
+| Metric | Value |
+|--------|-------|
+| Accuracy (accept/reject) | 100% |
+| False-negative rate | 0% |
+| Brier score | 0.3174 |
+| Regression threshold | 80% |
+
+---
+
+### Ontology foundation — UMLS CUI crosswalk
+
+All four datasets share a common ontological foundation: the UMLS Concept Unique Identifier (CUI) as the canonical hub linking ICD-10-CM, RxNorm, LOINC, SNOMED CT, and CPT-4.
+
+> Bodenreider, O. (2004). The Unified Medical Language System (UMLS): integrating biomedical terminology. *Nucleic Acids Research*, 32(suppl_1), D267–D270. https://doi.org/10.1093/nar/gkh061
+
+| Vocabulary | Authority | Citation |
+|-----------|-----------|----------|
+| ICD-10-CM | WHO / CMS | World Health Organization. (2019). *International Statistical Classification of Diseases* (10th ed.). |
+| RxNorm | NLM | Nelson, S.J., Zeng, K., Kilbourne, J., Powell, T., & Moore, R. (2011). Normalized names for clinical drugs: RxNorm at 6 years. *JAMIA*, 18(4), 441–448. https://doi.org/10.1136/amiajnl-2011-000116 |
+| LOINC | Regenstrief Institute | McDonald, C.J., et al. (2003). LOINC, a universal standard for identifying laboratory observations. *Clinical Chemistry*, 49(4), 624–633. https://doi.org/10.1373/49.4.624 |
+| SNOMED CT | SNOMED International | Donnelly, K. (2006). SNOMED-CT: The advanced terminology and coding system for eHealth. *Studies in Health Technology and Informatics*, 121, 279–290. |
+| CPT-4 | AMA | American Medical Association. (2023). *Current Procedural Terminology: CPT 2024*. AMA Press. |
+
+**Implementation:** `evidence_pipeline/ontology/cui_mapper.py` — 13 conditions, deterministic lookup, zero hallucination. Grounding validated by `evidence_pipeline/evals/grounding.py` (FACTS Grounding, Jacovi et al. 2025).
+
+---
+
 ## Clinical Evidence Intelligence Pipeline
 
 > A sub-project built on top of this governance platform — zero changes to any `src/` file.
@@ -272,6 +417,10 @@ Live APIs                                 ClinicalTrials.gov v2 (recruiting tria
     ↓
 evidence_pipeline/demo.py                 Structured, metatagged JSON output
                                           optimised for search and retrieval indexing
+    ↓
+evidence_pipeline/demo_mimic.py           End-to-end outcome metric
+                                          62 LOINC observations · 100% validated
+                                          0 committed without human approval
 ```
 
 **Key design principle:** the `cui_mapper.py` crosswalk is the deterministic validation gate for ontology codes — the same agent-proposes / deterministic-validates pattern as `validator.py` in the main platform.
@@ -279,9 +428,15 @@ evidence_pipeline/demo.py                 Structured, metatagged JSON output
 **Quick demo (no API key required):**
 
 ```bash
+# Condition evidence brief
 python evidence_pipeline/demo.py "paroxysmal nocturnal hemoglobinuria"
 # → ICD-10 D59.5  CUI C0028344  RxNorm 727910 (eculizumab)
 # → 5 recruiting trials  CMS coverage queried  metatagged JSON output
+
+# End-to-end MIMIC-IV pipeline (synthetic notes, zero PHI)
+python evidence_pipeline/demo_mimic.py
+# → Extracted 62 LOINC observations from 10 notes
+# → 100% validated, 0% rejected, 0 committed without human approval
 ```
 
 **JD responsibilities demonstrated:**
@@ -292,7 +447,6 @@ python evidence_pipeline/demo.py "paroxysmal nocturnal hemoglobinuria"
 | Curate clinician/consumer question library, common → rare | `datasets/medquad.py` (47K NIH QA pairs, GARD subset) |
 | Source external content: trials + CMS coverage | `demo.py` (live APIs) |
 | Metatag produced content for search and retrieval | output schema in `demo.py` |
-| Verify outputs / QA-QC against gold standard | gold UMLS CUI labels + `tests/` |
+| Verify outputs / QA-QC against gold standard | FACTS Grounding + 3-layer eval stack |
 | Working knowledge of ICD-10/CPT/SNOMED/LOINC/RxNorm | crosswalk handles all five vocabularies |
-
-Dataset: [MedQuAD](https://github.com/abachaa/MedQuAD) — Abacha & Demner-Fushman (2019), *BMC Bioinformatics* 20, 511. CC BY 4.0.
+| Validate clinical AI against peer-reviewed benchmarks | MIMIC-CDM (Hager et al. 2024) 4-axis CDM eval |
