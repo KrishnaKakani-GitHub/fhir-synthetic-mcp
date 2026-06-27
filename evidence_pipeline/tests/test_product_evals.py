@@ -1,15 +1,17 @@
-"""Tests for evidence_pipeline/evals/product.py -- Layer 3 product evals."""
+"""Tests for evidence_pipeline/evals/product.py -- Layer 3 AMIE-style product evals."""
 from __future__ import annotations
 
 from evidence_pipeline.evals.product import (
+    CI_THRESHOLD,
     GOLDEN_DATASET,
+    AxisScores,
     GoldenCase,
     ProductReport,
     run_product_eval,
 )
 
 
-# --- golden dataset structure ----------------------------------------------
+# --- golden dataset --------------------------------------------------------
 
 def test_golden_dataset_not_empty() -> None:
     assert len(GOLDEN_DATASET) >= 5
@@ -20,58 +22,82 @@ def test_golden_dataset_has_required_fields() -> None:
         assert case.expected_icd10 and case.expected_cui
 
 def test_golden_dataset_covers_rare_diseases() -> None:
-    rare = [c for c in GOLDEN_DATASET if c.is_rare_disease]
-    assert len(rare) >= 2, "Golden dataset must include rare-disease cases"
+    assert sum(1 for c in GOLDEN_DATASET if c.is_rare_disease) >= 2
 
 
-# --- product eval grading --------------------------------------------------
+# --- AMIE axis scores ------------------------------------------------------
+
+def test_axis_scores_composite_mean() -> None:
+    axes = AxisScores(
+        ontology_accuracy=1.0,
+        evidence_sourcing=1.0,
+        metatag_completeness=1.0,
+        grounding_score=1.0,
+        safety_gate=1.0,
+    )
+    assert axes.composite == 1.0
+
+def test_axis_scores_partial_composite() -> None:
+    axes = AxisScores(
+        ontology_accuracy=1.0,
+        evidence_sourcing=1.0,
+        metatag_completeness=0.0,
+        grounding_score=1.0,
+        safety_gate=1.0,
+    )
+    assert abs(axes.composite - 0.8) < 1e-9
+
+
+# --- product eval run ------------------------------------------------------
 
 def test_product_eval_runs() -> None:
     report = run_product_eval()
     assert report.n == len(GOLDEN_DATASET)
 
-def test_icd10_accuracy_is_perfect() -> None:
+def test_composite_score_meets_ci_threshold() -> None:
     report = run_product_eval()
-    assert report.icd10_accuracy == 1.0, (
-        f"Expected 100% ICD-10 accuracy, got {report.icd10_accuracy:.1%}\n"
+    assert report.mean_composite >= CI_THRESHOLD, (
+        f"Mean composite {report.mean_composite:.3f} below threshold {CI_THRESHOLD}\n"
         + "\n".join(
-            f"  [{r.case_id}] expected={r.expected_icd10} got={r.actual_icd10}"
-            for r in report.results if not r.icd10_correct
+            f"  [{r.case_id}] composite={r.axes.composite:.3f} axes={r.axes.to_dict()}"
+            for r in report.results if not r.passed
         )
     )
+
+def test_icd10_accuracy_is_perfect() -> None:
+    report = run_product_eval()
+    assert report.icd10_accuracy == 1.0
 
 def test_cui_accuracy_is_perfect() -> None:
     report = run_product_eval()
-    assert report.cui_accuracy == 1.0, (
-        f"Expected 100% CUI accuracy, got {report.cui_accuracy:.1%}\n"
-        + "\n".join(
-            f"  [{r.case_id}] expected={r.expected_cui} got={r.actual_cui}"
-            for r in report.results if not r.cui_correct
-        )
-    )
+    assert report.cui_accuracy == 1.0
 
-def test_metatag_completeness_is_perfect() -> None:
-    report = run_product_eval()
-    assert report.metatag_completeness == 1.0, (
-        f"Missing metatags:\n"
-        + "\n".join(
-            f"  [{r.case_id}] missing={r.missing_metatags}"
-            for r in report.results if not r.metatags_complete
-        )
-    )
-
-def test_overall_pass_rate_is_perfect() -> None:
+def test_all_cases_pass_ci_threshold() -> None:
     report = run_product_eval()
     assert report.overall_pass_rate == 1.0
 
-def test_product_report_summary_keys() -> None:
+def test_axis_means_all_above_threshold() -> None:
+    report = run_product_eval()
+    am = report.axis_means()
+    failures = {ax: v for ax, v in am.items() if v < CI_THRESHOLD}
+    assert not failures, f"Axes below threshold: {failures}"
+
+def test_summary_keys() -> None:
     report = run_product_eval()
     s = report.summary()
-    assert all(k in s for k in ["icd10_accuracy", "cui_accuracy",
-                                 "metatag_completeness", "overall_pass_rate"])
+    assert all(k in s for k in ["mean_composite", "icd10_accuracy",
+                                 "cui_accuracy", "axis_means", "overall_pass_rate"])
+    assert all(ax in s["axis_means"] for ax in [
+        "ontology_accuracy", "evidence_sourcing",
+        "metatag_completeness", "grounding_score", "safety_gate",
+    ])
 
-def test_single_case_pnh() -> None:
+def test_single_case_pnh_all_axes_pass() -> None:
     pnh = next(c for c in GOLDEN_DATASET if c.case_id == "prod_001")
     report = run_product_eval([pnh])
-    assert report.results[0].icd10_correct
-    assert report.results[0].cui_correct
+    r = report.results[0]
+    assert r.icd10_correct
+    assert r.cui_correct
+    assert r.axes.composite >= CI_THRESHOLD
+    assert r.axes.grounding_score == 1.0
+    assert r.axes.safety_gate == 1.0

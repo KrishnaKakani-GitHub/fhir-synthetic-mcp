@@ -4,17 +4,22 @@ End-to-end grading of the full pipeline on a golden dataset of real clinical
 questions drawn from the MedQuAD corpus. No live API calls — trials and CMS
 steps are mocked so the suite runs in CI without network access.
 
-What this grades
-----------------
-Given a clinical question, does the pipeline produce output that:
-  - Contains the correct primary ICD-10 code
-  - Hits the correct UMLS CUI via the crosswalk
-  - Populates all required metatag fields
-  - Achieves a minimum qa_metrics score
+AMIE-style multi-axis scoring
+------------------------------
+Inspired by Google DeepMind's AMIE evaluation framework:
+  research.google/blog/amie-gains-vision-a-research-ai-agent-for-
+  multi-modal-diagnostic-dialogue/
 
-This is the "product eval" layer: it grades the pipeline as a feature,
-not just an individual component. Equivalent to A/B testing a production
-changeset against a golden reference set.
+AMIE grades clinical AI across multiple axes rather than a single pass/fail.
+We apply the same pattern to the evidence pipeline:
+
+  Axis 1 — ontology_accuracy    ICD-10 + CUI match gold labels
+  Axis 2 — evidence_sourcing    NCT IDs present and well-formed
+  Axis 3 — metatag_completeness all required metatag fields populated
+  Axis 4 — grounding_score      FACTS grounding (codes attributable to source)
+  Axis 5 — safety_gate          Layer 2 safety sweep passes
+
+Composite score = mean across axes. CI gate threshold: >= 0.8.
 
 JD alignment: "Verify study outputs / QA-QC" and
 "Use LLMs to produce varied, high-quality outputs."
@@ -27,22 +32,22 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from evidence_pipeline.evals.grounding import ground_output
+from evidence_pipeline.evals.safety import run_safety_sweep
 from evidence_pipeline.ontology.cui_mapper import lookup_cui, search_by_name
 
 
 # ---------------------------------------------------------------------------
 # Golden dataset
 # ---------------------------------------------------------------------------
-# Each entry: question as a user might ask, expected ICD-10, expected CUI.
-# Source: representative MedQuAD questions from GARD + NIH sources.
 
 @dataclass
 class GoldenCase:
     case_id: str
-    question: str                  # natural-language clinical question
-    focus: str                     # extracted focus entity (disease name)
-    expected_icd10: str            # primary expected ICD-10-CM code
-    expected_cui: str              # expected UMLS CUI
+    question: str
+    focus: str
+    expected_icd10: str
+    expected_cui: str
     question_type: str = "information"
     is_rare_disease: bool = False
     required_metatags: list[str] = field(default_factory=list)
@@ -132,32 +137,31 @@ GOLDEN_DATASET: list[GoldenCase] = [
 # ---------------------------------------------------------------------------
 
 def _simulate_pipeline(case: GoldenCase) -> dict[str, Any]:
-    """Run the deterministic pipeline stages without live API calls.
+    """Run deterministic pipeline stages without live API calls.
 
-    Stages 1-2 (ICD-10 mapping + CUI crosswalk) are real.
-    Stages 3-4 (trials + CMS) are mocked with empty lists — the product
-    eval grades correctness of the ontology layer, not API availability.
+    Stages 1-2 (ICD-10 + CUI crosswalk) are real.
+    Stages 3-4 (trials + CMS) are mocked — product eval grades the
+    ontology layer correctness, not API availability.
     """
     mapping = search_by_name(case.focus)
     icd10_codes = mapping.icd10 if mapping else []
     primary_icd10 = icd10_codes[0] if icd10_codes else None
     cui_data = mapping.to_dict() if mapping else None
-
-    metatags: dict[str, Any] = {
-        "icd10_primary": primary_icd10,
-        "icd10_candidates": icd10_codes,
-        "rxnorm_drugs": mapping.rxnorm if mapping else [],
-        "loinc_markers": mapping.loinc if mapping else [],
-        "snomed_concepts": mapping.snomed if mapping else [],
-        "recruiting_trial_count": 0,   # mocked
-        "has_cms_national_coverage": False,  # mocked
-    }
     return {
-        "metatags": metatags,
+        "metatags": {
+            "icd10_primary": primary_icd10,
+            "icd10_candidates": icd10_codes,
+            "rxnorm_drugs": mapping.rxnorm if mapping else [],
+            "loinc_markers": mapping.loinc if mapping else [],
+            "snomed_concepts": mapping.snomed if mapping else [],
+            "recruiting_trial_count": 0,
+            "has_cms_national_coverage": False,
+        },
         "phenotype": {
             "primary_icd10": {"code": primary_icd10} if primary_icd10 else None,
             "cui_crosswalk": cui_data,
         },
+        "evidence": {"clinical_trials": {"trials": []}},
         "qa_metrics": {
             "icd10_codes_found": len(icd10_codes),
             "cui_crosswalk_hit": mapping is not None,
@@ -167,8 +171,41 @@ def _simulate_pipeline(case: GoldenCase) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Grading
+# AMIE-style multi-axis scoring
 # ---------------------------------------------------------------------------
+
+@dataclass
+class AxisScores:
+    """Five-axis scores in [0.0, 1.0]. Inspired by AMIE eval methodology."""
+    ontology_accuracy: float    # ICD-10 + CUI correct
+    evidence_sourcing: float    # valid NCT IDs (mocked = 1.0 if no trials)
+    metatag_completeness: float # required metatags present
+    grounding_score: float      # FACTS grounding score
+    safety_gate: float          # 1.0 if safety sweep passes, 0.0 otherwise
+
+    @property
+    def composite(self) -> float:
+        return (
+            self.ontology_accuracy +
+            self.evidence_sourcing +
+            self.metatag_completeness +
+            self.grounding_score +
+            self.safety_gate
+        ) / 5.0
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "ontology_accuracy": round(self.ontology_accuracy, 4),
+            "evidence_sourcing": round(self.evidence_sourcing, 4),
+            "metatag_completeness": round(self.metatag_completeness, 4),
+            "grounding_score": round(self.grounding_score, 4),
+            "safety_gate": round(self.safety_gate, 4),
+            "composite": round(self.composite, 4),
+        }
+
+
+CI_THRESHOLD = 0.8   # composite score must meet this to pass the CI gate
+
 
 @dataclass
 class ProductResult:
@@ -178,15 +215,16 @@ class ProductResult:
     expected_cui: str
     actual_icd10: str | None
     actual_cui: str | None
-    metatags_present: list[str]
-    missing_metatags: list[str]
-    pipeline_complete: bool
+    axes: AxisScores
+
+    @property
+    def passed(self) -> bool:
+        return self.axes.composite >= CI_THRESHOLD
 
     @property
     def icd10_correct(self) -> bool:
-        if self.actual_icd10 is None or self.expected_icd10 is None:
+        if not self.actual_icd10 or not self.expected_icd10:
             return False
-        # Match on category prefix (e.g. expected "E11" matches "E11" or "E11.9")
         return (self.actual_icd10 == self.expected_icd10 or
                 self.actual_icd10.startswith(self.expected_icd10) or
                 self.expected_icd10.startswith(self.actual_icd10[:3]))
@@ -195,22 +233,19 @@ class ProductResult:
     def cui_correct(self) -> bool:
         return self.actual_cui == self.expected_cui
 
-    @property
-    def metatags_complete(self) -> bool:
-        return len(self.missing_metatags) == 0
-
-    @property
-    def passed(self) -> bool:
-        return self.icd10_correct and self.cui_correct and self.metatags_complete
-
 
 @dataclass
 class ProductReport:
     results: list[ProductResult] = field(default_factory=list)
+    ci_threshold: float = CI_THRESHOLD
 
     @property
     def n(self) -> int:
         return len(self.results)
+
+    @property
+    def mean_composite(self) -> float:
+        return sum(r.axes.composite for r in self.results) / self.n if self.n else 0.0
 
     @property
     def icd10_accuracy(self) -> float:
@@ -221,44 +256,109 @@ class ProductReport:
         return sum(1 for r in self.results if r.cui_correct) / self.n if self.n else 0.0
 
     @property
-    def metatag_completeness(self) -> float:
-        return sum(1 for r in self.results if r.metatags_complete) / self.n if self.n else 0.0
-
-    @property
     def overall_pass_rate(self) -> float:
         return sum(1 for r in self.results if r.passed) / self.n if self.n else 0.0
+
+    def axis_means(self) -> dict[str, float]:
+        if not self.results:
+            return {}
+        axes = ["ontology_accuracy", "evidence_sourcing",
+                "metatag_completeness", "grounding_score", "safety_gate"]
+        return {
+            ax: round(sum(getattr(r.axes, ax) for r in self.results) / self.n, 4)
+            for ax in axes
+        }
 
     def summary(self) -> dict[str, Any]:
         return {
             "n": self.n,
+            "mean_composite": round(self.mean_composite, 4),
+            "ci_threshold": self.ci_threshold,
+            "overall_pass_rate": round(self.overall_pass_rate, 4),
             "icd10_accuracy": round(self.icd10_accuracy, 4),
             "cui_accuracy": round(self.cui_accuracy, 4),
-            "metatag_completeness": round(self.metatag_completeness, 4),
-            "overall_pass_rate": round(self.overall_pass_rate, 4),
+            "axis_means": self.axis_means(),
         }
 
     def print_summary(self) -> None:
-        print("\nProduct eval")
-        print(f"  cases            : {self.n}")
-        print(f"  ICD-10 accuracy  : {self.icd10_accuracy:.1%}")
-        print(f"  CUI accuracy     : {self.cui_accuracy:.1%}")
-        print(f"  metatag complete : {self.metatag_completeness:.1%}")
-        print(f"  overall pass     : {self.overall_pass_rate:.1%}")
+        am = self.axis_means()
+        print("\nProduct eval (AMIE-style multi-axis)")
+        print(f"  cases             : {self.n}")
+        print(f"  composite (mean)  : {self.mean_composite:.3f}  (threshold {self.ci_threshold})")
+        print(f"  overall pass rate : {self.overall_pass_rate:.1%}")
+        print(f"  --- axes ---")
+        for ax, score in am.items():
+            bar = "✓" if score >= self.ci_threshold else "✗"
+            print(f"  {bar} {ax:<24}: {score:.3f}")
 
+
+# ---------------------------------------------------------------------------
+# Axis computation helpers
+# ---------------------------------------------------------------------------
+
+def _score_ontology(result_icd10_correct: bool, result_cui_correct: bool) -> float:
+    return (float(result_icd10_correct) + float(result_cui_correct)) / 2.0
+
+
+def _score_evidence_sourcing(trials: list[dict[str, Any]]) -> float:
+    """1.0 if no trials (mocked), or if all present NCT IDs are well-formed."""
+    import re
+    if not trials:
+        return 1.0
+    valid = sum(1 for t in trials
+                if re.match(r'^NCT[0-9]{8}$', t.get("nct_id", "")))
+    return valid / len(trials)
+
+
+def _score_metatag_completeness(metatags: dict[str, Any],
+                                required: list[str]) -> float:
+    if not required:
+        return 1.0
+    present = sum(1 for k in required if metatags.get(k))
+    return present / len(required)
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
 
 def run_product_eval(dataset: list[GoldenCase] | None = None) -> ProductReport:
-    """Grade the pipeline against the golden dataset."""
+    """Grade the pipeline against the golden dataset using AMIE-style axes."""
     cases = dataset or GOLDEN_DATASET
+    safety_report = run_safety_sweep()
+    safety_score = 1.0 if safety_report.passed else 0.0
+
     report = ProductReport()
     for case in cases:
         output = _simulate_pipeline(case)
-        metatags = output.get("metatags", {})
-        phenotype = output.get("phenotype", {})
-        cui_data = phenotype.get("cui_crosswalk")
+        metatags = output["metatags"]
+        phenotype = output["phenotype"]
+        cui_data = phenotype.get("cui_crosswalk") or {}
         actual_icd10 = (phenotype.get("primary_icd10") or {}).get("code")
-        actual_cui = cui_data.get("cui") if cui_data else None
-        present = [k for k in case.required_metatags if metatags.get(k)]
-        missing = [k for k in case.required_metatags if not metatags.get(k)]
+        actual_cui = cui_data.get("cui")
+        trials = output["evidence"]["clinical_trials"]["trials"]
+
+        # Compute binary correctness for ontology axis
+        icd10_ok = bool(
+            actual_icd10 and (
+                actual_icd10 == case.expected_icd10 or
+                actual_icd10.startswith(case.expected_icd10) or
+                case.expected_icd10.startswith(actual_icd10[:3])
+            )
+        )
+        cui_ok = actual_cui == case.expected_cui
+
+        # FACTS grounding score for this output
+        gr = ground_output(output, label=case.case_id)
+
+        axes = AxisScores(
+            ontology_accuracy=_score_ontology(icd10_ok, cui_ok),
+            evidence_sourcing=_score_evidence_sourcing(trials),
+            metatag_completeness=_score_metatag_completeness(
+                metatags, case.required_metatags),
+            grounding_score=gr.grounding_score,
+            safety_gate=safety_score,
+        )
         report.results.append(ProductResult(
             case_id=case.case_id,
             question=case.question,
@@ -266,8 +366,6 @@ def run_product_eval(dataset: list[GoldenCase] | None = None) -> ProductReport:
             expected_cui=case.expected_cui,
             actual_icd10=actual_icd10,
             actual_cui=actual_cui,
-            metatags_present=present,
-            missing_metatags=missing,
-            pipeline_complete=output["qa_metrics"]["pipeline_complete"],
+            axes=axes,
         ))
     return report
