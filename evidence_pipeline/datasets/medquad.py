@@ -73,7 +73,7 @@ class MedQuADItem(BaseModel):
         if not self.source:
             return False
         src = self.source.lower()
-        return any(tag in src for tag in _RARE_DISEASE_SOURCES)
+        return any(tag.lower() in src for tag in _RARE_DISEASE_SOURCES)
 
 
 @dataclass

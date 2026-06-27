@@ -37,11 +37,11 @@ from typing import Any
 
 from evidence_pipeline.datasets.mimic_cdm import (
     CDMCase,
-    CDMReport,
     CDMScore,
     generate_synthetic_cdm_cases,
     score_case,
 )
+from evidence_pipeline.evals.clinical_decision import CDMReport
 from evidence_pipeline.ontology.cui_mapper import search_by_name
 
 log = logging.getLogger(__name__)
@@ -72,14 +72,14 @@ async def _run_agent_mock(case: CDMCase) -> AgentCDMResponse:
       result = await orchestrator.process_clinical_query(case.presentation)
       return parse_agent_cdm_response(case.case_id, result)
     """
-    mapping = search_by_name(case.primary_condition)
+    # CI mock: always return gold labels (deterministic upper bound).
+    # This verifies the eval machinery end-to-end without spending tokens.
+    # In production: call ClinicalOrchestrator and parse structured output.
     return AgentCDMResponse(
         case_id=case.case_id,
-        proposed_icd=case.diagnosis_icd,   # upper bound: gold labels
-        proposed_rxnorm=mapping.rxnorm[:2] if mapping and mapping.rxnorm
-                        else case.treatment_rxnorm,
-        proposed_loinc=mapping.loinc[:3] if mapping and mapping.loinc
-                       else case.labs_loinc,
+        proposed_icd=case.diagnosis_icd,
+        proposed_rxnorm=case.treatment_rxnorm,
+        proposed_loinc=case.labs_loinc,
         proposed_cpt=case.procedures_cpt,
         is_mocked=True,
     )

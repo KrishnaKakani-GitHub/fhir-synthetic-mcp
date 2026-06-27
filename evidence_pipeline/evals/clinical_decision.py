@@ -61,16 +61,10 @@ def _mock_llm_response(case: CDMCase) -> dict[str, list[str]]:
       result = await orchestrator.run(case.presentation)
       return parse_agent_output(result)
     """
-    # Use crosswalk to derive expected codes for the condition
-    mapping = search_by_name(case.primary_condition)
-    if mapping:
-        return {
-            "icd": case.diagnosis_icd,        # gold -- crosswalk confirms
-            "rxnorm": mapping.rxnorm[:2] if mapping.rxnorm else case.treatment_rxnorm,
-            "loinc": mapping.loinc[:3] if mapping.loinc else case.labs_loinc,
-            "cpt": case.procedures_cpt,
-        }
-    # Fallback: return gold labels (deterministic upper bound)
+    # CI mock: always return gold labels (deterministic upper bound).
+    # This verifies the eval machinery end-to-end without spending tokens.
+    # In production: call src.clinical_agent.orchestrator.ClinicalOrchestrator
+    # and parse structured output. Do NOT use gold labels in production.
     return {
         "icd": case.diagnosis_icd,
         "rxnorm": case.treatment_rxnorm,
