@@ -83,16 +83,16 @@ jobs:
           PYTHONPATH=$GITHUB_WORKSPACE python -c "
           from evidence_pipeline.evals.grounding import ground_crosswalk
           report = ground_crosswalk()
-          assert report.fully_grounded, f'Grounding violations: {report.violations}'
-          print(f'Grounding: {report.grounding_score:.3f}')
+          assert report.fully_grounded, f'Grounding violations: {report.total_violations}'
+          print(f'Grounding: {report.mean_grounding_score:.3f}')
           "
       - name: AMIE 5-axis eval — CI gate >= 0.80
         run: |
           PYTHONPATH=$GITHUB_WORKSPACE python -c "
           from evidence_pipeline.evals.product import run_product_eval, CI_THRESHOLD
           report = run_product_eval()
-          assert report.composite >= CI_THRESHOLD, f'AMIE {report.composite:.3f} < {CI_THRESHOLD}'
-          print(f'AMIE composite: {report.composite:.3f}')
+          assert report.mean_composite >= CI_THRESHOLD, f'AMIE {report.mean_composite:.3f} < {CI_THRESHOLD}'
+          print(f'AMIE composite: {report.mean_composite:.3f}')
           "
 
   evidence-pipeline-integration:
