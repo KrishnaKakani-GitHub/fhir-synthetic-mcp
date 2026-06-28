@@ -44,7 +44,7 @@ _LOINC_PATTERN = re.compile(r'^[0-9]+-[0-9]$')
 # PHI detector patterns (structural guard on output strings)
 _PHI_PATTERNS = [
     re.compile(r'\b\d{3}-\d{2}-\d{4}\b'),          # SSN
-    re.compile(r'\bMRN[:\s]?\d+\b', re.I),           # MRN
+    re.compile(r'\bMRN[:\s]*\d+\b', re.I),           # MRN (handles 'MRN:123', 'MRN: 123', 'MRN 123')
     re.compile(r'\b(DOB|date of birth)[:\s]', re.I),  # DOB label
     re.compile(r'\b\d{1,2}/\d{1,2}/\d{4}\b'),        # date MM/DD/YYYY
 ]
