@@ -6,7 +6,7 @@ the clinical governance agent on the MIMIC-CDM 4-axis rubric.
 Bridges both sub-projects
 --------------------------
   Input  : MIMIC-CDM cases (evidence_pipeline/datasets/mimic_cdm.py)
-  Agent  : src/clinical_agent/orchestrator.py -- the LLM governance agent
+  Agent  : evals/cdm_agent.py -- pluggable model backend (mock | meditron)
   Scoring: evidence_pipeline.datasets.mimic_cdm.score_case (CDMScore)
   Codes  : evidence_pipeline.ontology.cui_mapper (crosswalk validation)
 
@@ -22,8 +22,9 @@ CDM eval axes (Hager et al. Nature Medicine 2024)
   3. Lab ordering accuracy -- LOINC F1 vs gold lab orders
   4. Procedure accuracy    -- CPT F1 vs gold procedures
 
-CI mode: uses mocked governance agent output (deterministic, no LLM tokens)
-Prod mode: replace _run_agent() stub with real orchestrator call
+Backends (evals/cdm_agent.py)
+  mock     : echoes gold labels -> 1.000 by construction. CI default.
+  meditron : Meditron-7B via local Ollama. LOCAL-ONLY (never in CI).
 
 PHI NOTE: All cases in CI use synthetic CDM cases (zero patient data).
 For real MIMIC-CDM: log case_id only, never clinical presentation text.
@@ -47,6 +48,19 @@ from evidence_pipeline.ontology.cui_mapper import search_by_name
 log = logging.getLogger(__name__)
 
 
+def _gold_lookup(cases: list[CDMCase]) -> dict[str, dict[str, list[str]]]:
+    """Build case_id -> gold codes map for the mock backend."""
+    return {
+        c.case_id: {
+            "icd": c.diagnosis_icd,
+            "rxnorm": c.treatment_rxnorm,
+            "loinc": c.labs_loinc,
+            "cpt": c.procedures_cpt,
+        }
+        for c in cases
+    }
+
+
 # ---------------------------------------------------------------------------
 # Agent interface
 # ---------------------------------------------------------------------------
@@ -61,28 +75,6 @@ class AgentCDMResponse:
     proposed_cpt: list[str]
     raw_response: str = ""    # for debugging; never log in production
     is_mocked: bool = False
-
-
-async def _run_agent_mock(case: CDMCase) -> AgentCDMResponse:
-    """Mocked governance agent response for CI.
-
-    Production replacement:
-      from src.clinical_agent.orchestrator import ClinicalOrchestrator
-      orchestrator = ClinicalOrchestrator()
-      result = await orchestrator.process_clinical_query(case.presentation)
-      return parse_agent_cdm_response(case.case_id, result)
-    """
-    # CI mock: always return gold labels (deterministic upper bound).
-    # This verifies the eval machinery end-to-end without spending tokens.
-    # In production: call ClinicalOrchestrator and parse structured output.
-    return AgentCDMResponse(
-        case_id=case.case_id,
-        proposed_icd=case.diagnosis_icd,
-        proposed_rxnorm=case.treatment_rxnorm,
-        proposed_loinc=case.labs_loinc,
-        proposed_cpt=case.procedures_cpt,
-        is_mocked=True,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -151,20 +143,33 @@ class GovernanceCDMReport:
 async def run_governance_cdm_eval_async(
     cases: list[CDMCase] | None = None,
     use_mock: bool = True,
+    backend: str = "mock",
 ) -> GovernanceCDMReport:
-    """Async runner: evaluate governance agent on CDM cases.
+    """Async runner: evaluate the CDM model backend on CDM cases.
 
-    Set use_mock=False in production to call the real agent.
+    backend: 'mock' (CI default, deterministic) or 'meditron' (local Ollama).
+    use_mock is kept for backward compat; use_mock=False + backend='meditron'
+    runs the real model.
     """
+    from evals.cdm_agent import make_backend
+
     cases = cases or generate_synthetic_cdm_cases()
+    # Resolve backend: explicit non-mock backend overrides use_mock.
+    resolved = "mock" if (use_mock and backend == "mock") else backend
+    agent = make_backend(resolved, gold_lookup=_gold_lookup(cases))
+
     report = GovernanceCDMReport()
     for case in cases:
-        if use_mock:
-            agent_resp = await _run_agent_mock(case)
-        else:
-            raise NotImplementedError(
-                "Set use_mock=True for CI, or wire to ClinicalOrchestrator."
-            )
+        resp = agent.propose(case.case_id, case.presentation)
+        # Adapt cdm_agent.AgentCDMResponse -> local AgentCDMResponse shape.
+        agent_resp = AgentCDMResponse(
+            case_id=resp.case_id,
+            proposed_icd=resp.proposed_icd,
+            proposed_rxnorm=resp.proposed_rxnorm,
+            proposed_loinc=resp.proposed_loinc,
+            proposed_cpt=resp.proposed_cpt,
+            is_mocked=resp.is_mocked,
+        )
         score = score_case(
             case,
             predicted_icd=agent_resp.proposed_icd,
@@ -175,8 +180,8 @@ async def run_governance_cdm_eval_async(
         report.scores.append(score)
         report.agent_responses.append(agent_resp)
         log.info(
-            "[CDM] case_id=%s composite=%.3f mocked=%s",
-            case.case_id, score.composite, agent_resp.is_mocked,
+            "[CDM] case_id=%s composite=%.3f backend=%s",
+            case.case_id, score.composite, resolved,
         )
     return report
 
@@ -184,14 +189,26 @@ async def run_governance_cdm_eval_async(
 def run_governance_cdm_eval(
     cases: list[CDMCase] | None = None,
     use_mock: bool = True,
+    backend: str = "mock",
 ) -> GovernanceCDMReport:
     """Sync wrapper for run_governance_cdm_eval_async."""
-    return asyncio.run(run_governance_cdm_eval_async(cases, use_mock))
+    return asyncio.run(run_governance_cdm_eval_async(cases, use_mock, backend))
 
 
 if __name__ == "__main__":
+    import argparse
     import sys
+
+    parser = argparse.ArgumentParser(description="MIMIC-CDM governance eval")
+    parser.add_argument(
+        "--model", default="mock", choices=["mock", "meditron"],
+        help="Backend: 'mock' (CI default) or 'meditron' (local Ollama).",
+    )
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    report = run_governance_cdm_eval()
+
+    report = run_governance_cdm_eval(
+        use_mock=(args.model == "mock"), backend=args.model,
+    )
     report.print_summary()
     sys.exit(0 if report.passed else 1)
