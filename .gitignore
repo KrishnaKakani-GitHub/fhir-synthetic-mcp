@@ -40,3 +40,16 @@ htmlcov/
 # Eval outputs
 eval_report.json
 evals/results/
+
+# MIMIC / PhysioNet data \u2014 NEVER commit real clinical data
+# (loader also refuses to read from inside the repo, as defense-in-depth)
+mimic-demo/
+mimic-iv-demo/
+**/mimic-iv-demo/
+**/hosp/
+**/icu/
+*.csv.gz
+discharge.csv
+labevents.csv
+diagnoses_icd.csv
+demo_subject_id.csv
