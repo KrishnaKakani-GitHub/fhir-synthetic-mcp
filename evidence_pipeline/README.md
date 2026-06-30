@@ -3,7 +3,7 @@
 > **Sub-project of the [Clinical AI Governance Platform](../README.md)**  
 > *"I built the small version of your content pipeline."*
 
-An Atropos-aligned evidence generation system: clinical questions → ICD-10/RxNorm/LOINC/SNOMED phenotypes → structured, metatagged evidence records sourced from live NIH and CMS APIs.
+An evidence generation system: clinical questions → ICD-10/RxNorm/LOINC/SNOMED phenotypes → structured, metatagged evidence records sourced from live NIH and CMS APIs.
 
 ---
 
@@ -36,7 +36,7 @@ as `validator.py` gates LOINC observations in the main governance platform.
 
 ## JD mapping
 
-| Atropos responsibility | Module / evidence |
+| Responsibility | Module / evidence |
 |---|---|
 | Convert clinical questions → ICD-10/RxNorm/LOINC/CPT phenotypes | `ontology/cui_mapper.py` — deterministic CUI crosswalk |
 | Curate clinician/consumer question library, common → rare | `datasets/medquad.py` — 47K NIH QA pairs, GARD rare-disease subset |
@@ -87,4 +87,4 @@ This sub-project is **purely additive** — zero changes to:
 The main project demonstrates **how to safely govern clinical AI**.  
 This sub-project demonstrates **what that AI generates** — structured evidence content.
 
-Together they answer the full Atropos role: governance architecture *and* evidence generation capability.
+Together they answer the full role: governance architecture *and* evidence generation capability.

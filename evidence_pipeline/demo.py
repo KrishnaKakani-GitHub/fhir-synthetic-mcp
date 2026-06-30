@@ -180,7 +180,7 @@ def build_record(question: str, icd10: list[dict[str, Any]],
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
         "pipeline": "clinical-evidence-intelligence",
 
-        # Metatags: labels for Atropos search/retrieval indexing
+        # Metatags: labels for search/retrieval indexing
         "metatags": {
             "disease_area": primary["description"] if primary else question,
             "icd10_primary": primary["code"] if primary else None,
