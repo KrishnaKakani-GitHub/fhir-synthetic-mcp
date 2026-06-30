@@ -1,7 +1,7 @@
 """Tests for the MIMIC demo structured loader (evals/demo_structured.py).
 
 Includes the PHI-protection guarantees: refuses in-repo paths, drops
-date/PHI-adjacent columns, logs ids only.
+date/PHI-adjacent columns, logs ids only; and the lab label fallback.
 """
 from __future__ import annotations
 
@@ -25,10 +25,11 @@ def _make_demo(tmp_path: Path) -> Path:
     """Build a tiny fake hosp/ tree (synthetic, no real PHI)."""
     hosp = tmp_path / "hosp"
     hosp.mkdir()
+    # itemid 51222 has BLANK loinc -> should fall back to label "Hemoglobin"
     (hosp / "d_labitems.csv").write_text(
-        "itemid,loinc_code\n50931,2345-7\n51222,718-7\n")
+        "itemid,loinc_code,label\n50931,2345-7,Glucose\n51222,,Hemoglobin\n")
     (hosp / "diagnoses_icd.csv").write_text(
-        "subject_id,hadm_id,icd_code\n1,100,E11\n1,100,I10\n2,200,N18\n")
+        "subject_id,hadm_id,icd_code,icd_version\n1,100,E11,10\n1,100,I10,10\n2,200,4019,9\n")
     (hosp / "labevents.csv").write_text(
         "subject_id,hadm_id,itemid,charttime\n1,100,50931,2150-01-01\n2,200,51222,2150-02-02\n")
     (hosp / "prescriptions.csv").write_text(
@@ -73,9 +74,17 @@ def test_loader_builds_structured_cases(tmp_path):
     by_hadm = {c.hadm_id: c for c in cases}
     assert set(by_hadm) == {"100", "200"}
     assert by_hadm["100"].diagnosis_icd == ["E11", "I10"]
-    assert by_hadm["100"].labs_loinc == ["2345-7"]   # itemid 50931 -> LOINC
+    assert by_hadm["100"].labs == ["2345-7"]          # itemid 50931 -> LOINC
+    assert by_hadm["200"].labs == ["Hemoglobin"]      # blank LOINC -> label fallback
     assert by_hadm["100"].drugs == ["Metformin"]
     assert by_hadm["200"].procedures_icd == ["0016070"]
+
+
+def test_icd_version_recorded(tmp_path):
+    demo = _make_demo(tmp_path)
+    by_hadm = {c.hadm_id: c for c in DemoStructuredLoader(demo).load()}
+    assert by_hadm["100"].icd_version == "10"
+    assert by_hadm["200"].icd_version == "9"
 
 
 def test_loader_respects_limit(tmp_path):
@@ -95,4 +104,4 @@ def test_summary_line_has_counts_not_values(tmp_path):
 
 def test_structured_case_defaults():
     c = StructuredCase(hadm_id="x")
-    assert c.diagnosis_icd == [] and c.labs_loinc == []
+    assert c.diagnosis_icd == [] and c.labs == []

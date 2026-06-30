@@ -11,12 +11,12 @@ Two modes
 2. STRUCTURED DEMO -- Meditron reads REAL de-identified MIMIC-IV *demo*
    structured data (coded labs + drugs per admission; the demo has NO free-text
    notes) and proposes a diagnosis. The demo's coded gold ICD diagnoses are
-   present, so this can be shown unscored or lightly compared.
+   present (mixed ICD-9 / ICD-10), shown for reference, unscored.
 
     python evals/run_cdm.py --model meditron --demo-dir /path/OUTSIDE/repo/mimic-demo
 
 The MIMIC-IV demo excludes free-text notes, so there is no "discharge note" to
-read. We use the coded hosp/ tables (diagnoses_icd, labevents->LOINC,
+read. We use the coded hosp/ tables (diagnoses_icd, labevents->LOINC/label,
 prescriptions, procedures_icd) instead.
 
 The 'meditron' backend is LOCAL-ONLY. Prerequisites:
@@ -66,11 +66,11 @@ def _run_scored(model: str, as_json: bool) -> int:
 
 def _present(case) -> str:
     """Build a structured presentation string from coded fields (no free text)."""
-    labs = ", ".join(case.labs_loinc[:12]) or "none recorded"
+    labs = ", ".join(case.labs[:12]) or "none recorded"
     drugs = ", ".join(case.drugs[:12]) or "none recorded"
-    return (f"Admission with the following ordered labs (LOINC): {labs}. "
+    return (f"Admission with the following ordered labs: {labs}. "
             f"Medications administered: {drugs}. "
-            f"Propose the most likely diagnosis as ICD codes.")
+            f"Propose the most likely diagnosis as ICD-10 codes.")
 
 
 def _run_demo(model: str, demo_dir: str, limit: int) -> int:
@@ -100,8 +100,11 @@ def _run_demo(model: str, demo_dir: str, limit: int) -> int:
     for case in cases:
         resp = agent.propose(case.hadm_id, _present(case))
         print(f"\n  {case.summary_line()}")
-        print(f"    model diagnosis (ICD) : {resp.proposed_icd or '\u2014'}")
-        print(f"    gold diagnosis (ICD)  : {case.diagnosis_icd[:6] or '\u2014'}")
+        print(f"    model diagnosis (ICD-10) : {resp.proposed_icd or '\u2014'}")
+        gold_ver = f" [ICD-{case.icd_version}]" if case.icd_version else ""
+        print(f"    gold diagnosis{gold_ver} : {case.diagnosis_icd[:6] or '\u2014'}")
+        if case.icd_version and "9" in case.icd_version.split("/"):
+            print("      note: gold is ICD-9; model emits ICD-10 \u2014 not directly comparable.")
 
     print("\n  (Demonstration only \u2014 reference comparison, not a scored metric.)")
     return 0
